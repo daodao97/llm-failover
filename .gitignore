@@ -1,0 +1,8 @@
+/build/
+/dist/
+/.idea/
+/.vscode/
+*.out
+*.test
+*.log
+coverage.out
