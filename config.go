@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"net/http"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 // 渠道类型常量
@@ -180,7 +182,11 @@ type Channel struct {
 	Name    string
 	BaseURL string
 	Enabled bool
-	Headers http.Header
+	// ChannelGroupID 标记该运行时渠道是从哪个 token 渠道分组展开出来的；0 表示非分组来源。
+	ChannelGroupID int
+	// ChannelGroupMultiplier 标记该运行时渠道所属分组的计费倍率；默认 1。
+	ChannelGroupMultiplier decimal.Decimal
+	Headers                http.Header
 	// ModelRewrite 按顺序匹配请求中的 model 并重写
 	ModelRewrite []ModelRewriteRule
 	Handler      func(ctx *Context) (*http.Response, error)
@@ -245,10 +251,11 @@ var _ = NoRetry()
 
 func NewChannel(id int, name, baseURL string) Channel {
 	return Channel{
-		Id:      id,
-		Name:    name,
-		BaseURL: baseURL,
-		Enabled: true,
-		Headers: make(http.Header),
+		Id:                     id,
+		Name:                   name,
+		BaseURL:                baseURL,
+		Enabled:                true,
+		ChannelGroupMultiplier: decimal.NewFromInt(1),
+		Headers:                make(http.Header),
 	}
 }
