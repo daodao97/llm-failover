@@ -21,7 +21,9 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 	baseHeader, keys, internalHandler, err := p.prepareChannelAttempt(r, ctx, ch)
 	if err != nil {
 		wrapped := wrapChannelError(ch, err)
-		p.recordCircuitFailure(r, ctx, ch, wrapped)
+		if shouldRecordAttemptFailureForCircuit(ch) {
+			p.recordCircuitFailure(r, ctx, ch, wrapped)
+		}
 		return nil, wrapped
 	}
 	if internalHandler != nil {
@@ -30,7 +32,9 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 			return nil, wrapChannelError(ch, errEmptyResponseInternalHandler)
 		}
 		wrapped := wrapChannelError(ch, err)
-		p.recordCircuitFailure(r, ctx, ch, wrapped)
+		if shouldRecordAttemptFailureForCircuit(ch) {
+			p.recordCircuitFailure(r, ctx, ch, wrapped)
+		}
 		return resp, wrapped
 	}
 
@@ -73,7 +77,7 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 					emitAttemptError(err)
 					return nil, err
 				}
-				if p.recordCircuitFailure(r, ctx, ch, err) {
+				if shouldRecordAttemptFailureForCircuit(ch) && p.recordCircuitFailure(r, ctx, ch, err) {
 					emitAttemptError(err)
 					return nil, wrapChannelError(ch, lastErr)
 				}
@@ -94,7 +98,7 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 			if decision.reason != "" {
 				var retryReason string
 				lastErr, retryReason = p.buildRetryError(ctx, resp, decision)
-				if p.recordCircuitFailure(r, ctx, ch, lastErr) {
+				if shouldRecordAttemptFailureForCircuit(ch) && p.recordCircuitFailure(r, ctx, ch, lastErr) {
 					resp.Body.Close()
 					emitAttemptError(lastErr)
 					return nil, wrapChannelError(ch, lastErr)
@@ -117,7 +121,9 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 				lastErr = wrapChannelError(ch, fmt.Errorf("status: %d", resp.StatusCode))
 				ctx.LastStatusCode = resp.StatusCode
 				ctx.LastResponseHeader = resp.Header.Clone()
-				p.recordCircuitFailure(r, ctx, ch, lastErr)
+				if shouldRecordAttemptFailureForCircuit(ch) {
+					p.recordCircuitFailure(r, ctx, ch, lastErr)
+				}
 				emitAttemptError(lastErr)
 				return resp, lastErr
 			}

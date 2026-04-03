@@ -370,6 +370,101 @@ func TestTryChannelsHalfOpenProbeDoesNotHideFailureWithRetries(t *testing.T) {
 	}
 }
 
+func TestTryChannelsPoolInternalKeyFailureDoesNotOpenChannelCircuit(t *testing.T) {
+	poolBadKeyAttempts := 0
+	poolGoodKeyAttempts := 0
+	fallbackAttempts := 0
+	channels := []Channel{
+		{
+			Id:      1,
+			Name:    "pool",
+			BaseURL: "https://pool.example.com",
+			Enabled: true,
+			CType:   CTypePool,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{
+					{ID: "bad-key", Value: "bad-value"},
+					{ID: "good-key", Value: "good-value"},
+				}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				switch ctx.CurrentKey.ID {
+				case "bad-key":
+					poolBadKeyAttempts++
+					return &http.Response{
+						StatusCode: http.StatusTooManyRequests,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"429"}}`)),
+					}, nil
+				case "good-key":
+					poolGoodKeyAttempts++
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       http.NoBody,
+					}, nil
+				default:
+					t.Fatalf("unexpected key id: %s", ctx.CurrentKey.ID)
+					return nil, nil
+				}
+			},
+		},
+		{
+			Id:      2,
+			Name:    "fallback",
+			BaseURL: "https://fallback.example.com",
+			Enabled: true,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "fallback-key", Value: "fallback-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				fallbackAttempts++
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       http.NoBody,
+				}, nil
+			},
+		},
+	}
+
+	p := New(Config{
+		Retry: RetryConfig{
+			MaxAttempts: 1,
+			RetryOnResponse: func(ctx *Context, ch *Channel, code int, body []byte) bool {
+				return code == http.StatusTooManyRequests
+			},
+		},
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         2,
+			ErrorRateThreshold: 0.5,
+			FailureWindow:      time.Second,
+			Cooldown:           time.Minute,
+		},
+	})
+
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+		ctx := &Context{Request: req}
+		result := p.tryChannels(req, ctx, channels, p.cfg.Retry)
+		if result.successResp == nil {
+			t.Fatalf("request %d should succeed within pool channel", i+1)
+		}
+		writeSuccessfulPipelineResult(t, p, req, ctx, result)
+	}
+
+	if poolBadKeyAttempts != 3 {
+		t.Fatalf("poolBadKeyAttempts=%d, want=3", poolBadKeyAttempts)
+	}
+	if poolGoodKeyAttempts != 3 {
+		t.Fatalf("poolGoodKeyAttempts=%d, want=3", poolGoodKeyAttempts)
+	}
+	if fallbackAttempts != 0 {
+		t.Fatalf("fallbackAttempts=%d, want=0 because pool channel should stay healthy", fallbackAttempts)
+	}
+}
+
 func TestTryChannelsPoolNoKeysConcurrencyLimitedDoesNotOpenCircuit(t *testing.T) {
 	poolAttempts := 0
 	goodAttempts := 0

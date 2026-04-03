@@ -114,6 +114,9 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 		if err != nil {
 			result.lastErr = err
 			p.handleChannelAttemptFailure(r, ctx, resp, err, &result.lastResp)
+			if !shouldRecordAttemptFailureForCircuit(&channels[i]) {
+				p.recordCircuitFailure(r, ctx, &channels[i], err)
+			}
 			if !p.shouldContinueToNextChannel(ctx, &channels[i], channelRetryCfg, err) {
 				return result
 			}
@@ -140,6 +143,13 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 	}
 
 	return result
+}
+
+func shouldRecordAttemptFailureForCircuit(ch *Channel) bool {
+	if ch == nil {
+		return false
+	}
+	return ch.CType != CTypePool
 }
 
 func (p *Proxy) recordCircuitFailure(r *http.Request, ctx *Context, ch *Channel, err error) bool {
