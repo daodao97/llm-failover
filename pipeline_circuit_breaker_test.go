@@ -1234,3 +1234,102 @@ func TestChannelCircuitBreakerSnapshotIncludesLastFailureStatusCode(t *testing.T
 		t.Fatalf("lastFailureStatusCode=%d, want=%d", snapshots[0].LastFailureStatusCode, http.StatusForbidden)
 	}
 }
+
+func TestChannelCircuitBreakerSnapshotIncludesDetailedBreakdown(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	breaker := newChannelCircuitBreaker("message", CircuitBreakerConfig{
+		Enabled:                true,
+		MinSamples:             10,
+		ErrorRateThreshold:     1,
+		FailureWindow:          time.Minute,
+		Cooldown:               15 * time.Second,
+		StreamSlowThreshold:    10 * time.Millisecond,
+		NonStreamSlowThreshold: 20 * time.Millisecond,
+		SlowRateThreshold:      1,
+	})
+	breaker.now = func() time.Time { return now }
+
+	ch := &Channel{Id: 9, Name: "mixed"}
+
+	if opened, wait, _ := breaker.RecordSuccess(ch, 5*time.Millisecond, false); opened || wait != 0 {
+		t.Fatalf("first success should not open: opened=%v wait=%s", opened, wait)
+	}
+
+	now = now.Add(time.Second)
+	if opened, reopen, wait, _ := breaker.RecordFailure(ch, 25*time.Millisecond, false, http.StatusBadGateway); opened || reopen || wait != 0 {
+		t.Fatalf("non-stream failure should not open: opened=%v reopen=%v wait=%s", opened, reopen, wait)
+	}
+
+	lastSuccessAt := now.Add(time.Second)
+	now = lastSuccessAt
+	if opened, wait, _ := breaker.RecordSuccess(ch, 15*time.Millisecond, true); opened || wait != 0 {
+		t.Fatalf("stream success should not open: opened=%v wait=%s", opened, wait)
+	}
+
+	lastFailureAt := now.Add(time.Second)
+	now = lastFailureAt
+	if opened, reopen, wait, _ := breaker.RecordFailure(ch, 8*time.Millisecond, true, http.StatusTooManyRequests); opened || reopen || wait != 0 {
+		t.Fatalf("stream failure should not open: opened=%v reopen=%v wait=%s", opened, reopen, wait)
+	}
+
+	snapshots := breaker.Snapshot()
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshot len=%d, want=1", len(snapshots))
+	}
+
+	snapshot := snapshots[0]
+	if snapshot.RequestCount != 4 {
+		t.Fatalf("requestCount=%d, want=4", snapshot.RequestCount)
+	}
+	if snapshot.SuccessCount != 2 {
+		t.Fatalf("successCount=%d, want=2", snapshot.SuccessCount)
+	}
+	if snapshot.FailureCount != 2 {
+		t.Fatalf("failureCount=%d, want=2", snapshot.FailureCount)
+	}
+	if snapshot.SlowCount != 2 {
+		t.Fatalf("slowCount=%d, want=2", snapshot.SlowCount)
+	}
+	if snapshot.StreamRequestCount != 2 || snapshot.StreamSuccessCount != 1 || snapshot.StreamFailureCount != 1 || snapshot.StreamSlowCount != 1 {
+		t.Fatalf("unexpected stream breakdown: %+v", snapshot)
+	}
+	if snapshot.NonStreamRequestCount != 2 || snapshot.NonStreamSuccessCount != 1 || snapshot.NonStreamFailureCount != 1 || snapshot.NonStreamSlowCount != 1 {
+		t.Fatalf("unexpected non-stream breakdown: %+v", snapshot)
+	}
+	if snapshot.AvgLatencyMs != 13 {
+		t.Fatalf("avgLatencyMs=%d, want=13", snapshot.AvgLatencyMs)
+	}
+	if snapshot.StreamAvgLatencyMs != 11 {
+		t.Fatalf("streamAvgLatencyMs=%d, want=11", snapshot.StreamAvgLatencyMs)
+	}
+	if snapshot.NonStreamAvgLatencyMs != 15 {
+		t.Fatalf("nonStreamAvgLatencyMs=%d, want=15", snapshot.NonStreamAvgLatencyMs)
+	}
+	if snapshot.MaxLatencyMs != 25 || snapshot.P95LatencyMs != 25 {
+		t.Fatalf("unexpected overall latency stats: max=%d p95=%d", snapshot.MaxLatencyMs, snapshot.P95LatencyMs)
+	}
+	if snapshot.StreamMaxLatencyMs != 15 || snapshot.StreamP95LatencyMs != 15 {
+		t.Fatalf("unexpected stream latency stats: max=%d p95=%d", snapshot.StreamMaxLatencyMs, snapshot.StreamP95LatencyMs)
+	}
+	if snapshot.NonStreamMaxLatencyMs != 25 || snapshot.NonStreamP95LatencyMs != 25 {
+		t.Fatalf("unexpected non-stream latency stats: max=%d p95=%d", snapshot.NonStreamMaxLatencyMs, snapshot.NonStreamP95LatencyMs)
+	}
+	if snapshot.LastSuccessLatencyMs != 15 {
+		t.Fatalf("lastSuccessLatencyMs=%d, want=15", snapshot.LastSuccessLatencyMs)
+	}
+	if snapshot.LastFailureLatencyMs != 8 {
+		t.Fatalf("lastFailureLatencyMs=%d, want=8", snapshot.LastFailureLatencyMs)
+	}
+	if !snapshot.LastSuccessAt.Equal(lastSuccessAt) {
+		t.Fatalf("lastSuccessAt=%s, want=%s", snapshot.LastSuccessAt, lastSuccessAt)
+	}
+	if !snapshot.LastFailureAt.Equal(lastFailureAt) {
+		t.Fatalf("lastFailureAt=%s, want=%s", snapshot.LastFailureAt, lastFailureAt)
+	}
+	if snapshot.OpenRemainingSec != 0 {
+		t.Fatalf("openRemainingSec=%d, want=0", snapshot.OpenRemainingSec)
+	}
+	if snapshot.ConsecutiveOpenCount != 0 {
+		t.Fatalf("consecutiveOpenCount=%d, want=0", snapshot.ConsecutiveOpenCount)
+	}
+}

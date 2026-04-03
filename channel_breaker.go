@@ -24,8 +24,17 @@ type ChannelHealthSnapshot struct {
 	OpenReason               string    `json:"open_reason"`
 	LastFailureStatusCode    int       `json:"last_failure_status_code"`
 	RequestCount             int       `json:"request_count"`
+	SuccessCount             int       `json:"success_count"`
 	FailureCount             int       `json:"failure_count"`
 	SlowCount                int       `json:"slow_count"`
+	StreamRequestCount       int       `json:"stream_request_count"`
+	StreamSuccessCount       int       `json:"stream_success_count"`
+	StreamFailureCount       int       `json:"stream_failure_count"`
+	StreamSlowCount          int       `json:"stream_slow_count"`
+	NonStreamRequestCount    int       `json:"non_stream_request_count"`
+	NonStreamSuccessCount    int       `json:"non_stream_success_count"`
+	NonStreamFailureCount    int       `json:"non_stream_failure_count"`
+	NonStreamSlowCount       int       `json:"non_stream_slow_count"`
 	MinSamples               int       `json:"min_samples"`
 	ErrorRate                float64   `json:"error_rate"`
 	ErrorRateThreshold       float64   `json:"error_rate_threshold"`
@@ -33,13 +42,26 @@ type ChannelHealthSnapshot struct {
 	SlowRateThreshold        float64   `json:"slow_rate_threshold"`
 	FailureWindowSec         int64     `json:"failure_window_sec"`
 	CooldownSec              int64     `json:"cooldown_sec"`
+	OpenRemainingSec         int64     `json:"open_remaining_sec"`
+	ConsecutiveOpenCount     int       `json:"consecutive_open_count"`
 	AvgLatencyMs             int64     `json:"avg_latency_ms"`
+	P95LatencyMs             int64     `json:"p95_latency_ms"`
 	MaxLatencyMs             int64     `json:"max_latency_ms"`
+	StreamAvgLatencyMs       int64     `json:"stream_avg_latency_ms"`
+	StreamP95LatencyMs       int64     `json:"stream_p95_latency_ms"`
+	StreamMaxLatencyMs       int64     `json:"stream_max_latency_ms"`
+	NonStreamAvgLatencyMs    int64     `json:"non_stream_avg_latency_ms"`
+	NonStreamP95LatencyMs    int64     `json:"non_stream_p95_latency_ms"`
+	NonStreamMaxLatencyMs    int64     `json:"non_stream_max_latency_ms"`
 	LastLatencyMs            int64     `json:"last_latency_ms"`
+	LastSuccessLatencyMs     int64     `json:"last_success_latency_ms"`
+	LastFailureLatencyMs     int64     `json:"last_failure_latency_ms"`
 	SlowThresholdMs          int64     `json:"slow_threshold_ms"`
 	LastLatencyMode          string    `json:"last_latency_mode"`
 	StreamSlowThresholdMs    int64     `json:"stream_slow_threshold_ms"`
 	NonStreamSlowThresholdMs int64     `json:"non_stream_slow_threshold_ms"`
+	LastSuccessAt            time.Time `json:"last_success_at,omitempty"`
+	LastFailureAt            time.Time `json:"last_failure_at,omitempty"`
 	OpenUntil                time.Time `json:"open_until,omitempty"`
 	UpdatedAt                time.Time `json:"updated_at,omitempty"`
 }
@@ -73,6 +95,36 @@ type channelCircuitBreaker struct {
 	scope  string
 	cfg    CircuitBreakerConfig
 	states map[string]*channelCircuitState
+}
+
+type channelEventSummary struct {
+	RequestCount          int
+	SuccessCount          int
+	FailureCount          int
+	SlowCount             int
+	StreamRequestCount    int
+	StreamSuccessCount    int
+	StreamFailureCount    int
+	StreamSlowCount       int
+	NonStreamRequestCount int
+	NonStreamSuccessCount int
+	NonStreamFailureCount int
+	NonStreamSlowCount    int
+	TotalLatency          time.Duration
+	StreamTotalLatency    time.Duration
+	NonStreamTotalLatency time.Duration
+	MaxLatency            time.Duration
+	StreamMaxLatency      time.Duration
+	NonStreamMaxLatency   time.Duration
+	LastLatency           time.Duration
+	LastLatencyMode       string
+	LastSuccessAt         time.Time
+	LastFailureAt         time.Time
+	LastSuccessLatency    time.Duration
+	LastFailureLatency    time.Duration
+	Latencies             []time.Duration
+	StreamLatencies       []time.Duration
+	NonStreamLatencies    []time.Duration
 }
 
 type channelBreakerRegistry struct {
@@ -185,13 +237,13 @@ func (b *channelCircuitBreaker) RecordSuccess(ch *Channel, latency time.Duration
 		state.openUntil = time.Time{}
 	}
 
-	requestCount, failureCount, slowCount, _, _, _, _ := summarizeEvents(state.events)
-	if requestCount == 0 {
+	summary := summarizeEvents(state.events)
+	if summary.RequestCount == 0 {
 		return false, 0, ""
 	}
-	errorRate := float64(failureCount) / float64(requestCount)
-	slowRate := float64(slowCount) / float64(requestCount)
-	shouldOpen, openReason := b.shouldOpen(state, requestCount, errorRate, slowRate)
+	errorRate := float64(summary.FailureCount) / float64(summary.RequestCount)
+	slowRate := float64(summary.SlowCount) / float64(summary.RequestCount)
+	shouldOpen, openReason := b.shouldOpen(state, summary.RequestCount, errorRate, slowRate)
 	if !shouldOpen {
 		return false, 0, ""
 	}
@@ -225,17 +277,17 @@ func (b *channelCircuitBreaker) RecordFailure(ch *Channel, latency time.Duration
 	state.lastLatency = latency
 	state.lastFailureStatus = statusCode
 
-	requestCount, failureCount, slowCount, _, _, _, _ := summarizeEvents(state.events)
+	summary := summarizeEvents(state.events)
 	errorRate := 0.0
-	if requestCount > 0 {
-		errorRate = float64(failureCount) / float64(requestCount)
+	if summary.RequestCount > 0 {
+		errorRate = float64(summary.FailureCount) / float64(summary.RequestCount)
 	}
 	slowRate := 0.0
-	if requestCount > 0 {
-		slowRate = float64(slowCount) / float64(requestCount)
+	if summary.RequestCount > 0 {
+		slowRate = float64(summary.SlowCount) / float64(summary.RequestCount)
 	}
 
-	shouldOpen, openReason := b.shouldOpen(state, requestCount, errorRate, slowRate)
+	shouldOpen, openReason := b.shouldOpen(state, summary.RequestCount, errorRate, slowRate)
 	if !shouldOpen {
 		return false, false, 0, ""
 	}
@@ -283,16 +335,24 @@ func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
 			delete(b.states, key)
 			continue
 		}
-		requestCount, failureCount, slowCount, totalLatency, maxLatency, lastLatency, lastLatencyMode := summarizeEvents(state.events)
+		summary := summarizeEvents(state.events)
 		errorRate := 0.0
-		if requestCount > 0 {
-			errorRate = float64(failureCount) / float64(requestCount)
+		if summary.RequestCount > 0 {
+			errorRate = float64(summary.FailureCount) / float64(summary.RequestCount)
 		}
 		slowRate := 0.0
 		avgLatencyMs := int64(0)
-		if requestCount > 0 {
-			slowRate = float64(slowCount) / float64(requestCount)
-			avgLatencyMs = totalLatency.Milliseconds() / int64(requestCount)
+		streamAvgLatencyMs := int64(0)
+		nonStreamAvgLatencyMs := int64(0)
+		if summary.RequestCount > 0 {
+			slowRate = float64(summary.SlowCount) / float64(summary.RequestCount)
+			avgLatencyMs = summary.TotalLatency.Milliseconds() / int64(summary.RequestCount)
+		}
+		if summary.StreamRequestCount > 0 {
+			streamAvgLatencyMs = summary.StreamTotalLatency.Milliseconds() / int64(summary.StreamRequestCount)
+		}
+		if summary.NonStreamRequestCount > 0 {
+			nonStreamAvgLatencyMs = summary.NonStreamTotalLatency.Milliseconds() / int64(summary.NonStreamRequestCount)
 		}
 
 		status := "closed"
@@ -303,6 +363,11 @@ func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
 			status = "half_open"
 		}
 
+		openRemainingSec := int64(0)
+		if state.openUntil.After(now) {
+			openRemainingSec = int64(math.Ceil(state.openUntil.Sub(now).Seconds()))
+		}
+
 		snapshots = append(snapshots, ChannelHealthSnapshot{
 			Scope:                    b.scope,
 			ChannelKey:               key,
@@ -311,9 +376,18 @@ func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
 			Status:                   status,
 			OpenReason:               state.openReason,
 			LastFailureStatusCode:    state.lastFailureStatus,
-			RequestCount:             requestCount,
-			FailureCount:             failureCount,
-			SlowCount:                slowCount,
+			RequestCount:             summary.RequestCount,
+			SuccessCount:             summary.SuccessCount,
+			FailureCount:             summary.FailureCount,
+			SlowCount:                summary.SlowCount,
+			StreamRequestCount:       summary.StreamRequestCount,
+			StreamSuccessCount:       summary.StreamSuccessCount,
+			StreamFailureCount:       summary.StreamFailureCount,
+			StreamSlowCount:          summary.StreamSlowCount,
+			NonStreamRequestCount:    summary.NonStreamRequestCount,
+			NonStreamSuccessCount:    summary.NonStreamSuccessCount,
+			NonStreamFailureCount:    summary.NonStreamFailureCount,
+			NonStreamSlowCount:       summary.NonStreamSlowCount,
 			MinSamples:               b.cfg.MinSamples,
 			ErrorRate:                errorRate,
 			ErrorRateThreshold:       b.cfg.ErrorRateThreshold,
@@ -321,13 +395,26 @@ func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
 			SlowRateThreshold:        b.cfg.SlowRateThreshold,
 			FailureWindowSec:         int64(b.cfg.FailureWindow / time.Second),
 			CooldownSec:              int64(state.cooldownForDisplay(b.cfg.Cooldown) / time.Second),
+			OpenRemainingSec:         openRemainingSec,
+			ConsecutiveOpenCount:     state.consecutiveOpenCnt,
 			AvgLatencyMs:             avgLatencyMs,
-			MaxLatencyMs:             maxLatency.Milliseconds(),
-			LastLatencyMs:            lastLatency.Milliseconds(),
-			SlowThresholdMs:          selectedSlowThreshold(lastLatencyMode == "stream", b.cfg).Milliseconds(),
-			LastLatencyMode:          lastLatencyMode,
+			P95LatencyMs:             latencyPercentileMs(summary.Latencies, 0.95),
+			MaxLatencyMs:             summary.MaxLatency.Milliseconds(),
+			StreamAvgLatencyMs:       streamAvgLatencyMs,
+			StreamP95LatencyMs:       latencyPercentileMs(summary.StreamLatencies, 0.95),
+			StreamMaxLatencyMs:       summary.StreamMaxLatency.Milliseconds(),
+			NonStreamAvgLatencyMs:    nonStreamAvgLatencyMs,
+			NonStreamP95LatencyMs:    latencyPercentileMs(summary.NonStreamLatencies, 0.95),
+			NonStreamMaxLatencyMs:    summary.NonStreamMaxLatency.Milliseconds(),
+			LastLatencyMs:            summary.LastLatency.Milliseconds(),
+			LastSuccessLatencyMs:     summary.LastSuccessLatency.Milliseconds(),
+			LastFailureLatencyMs:     summary.LastFailureLatency.Milliseconds(),
+			SlowThresholdMs:          selectedSlowThreshold(summary.LastLatencyMode == "stream", b.cfg).Milliseconds(),
+			LastLatencyMode:          summary.LastLatencyMode,
 			StreamSlowThresholdMs:    effectiveStreamSlowThreshold(b.cfg).Milliseconds(),
 			NonStreamSlowThresholdMs: effectiveNonStreamSlowThreshold(b.cfg).Milliseconds(),
+			LastSuccessAt:            summary.LastSuccessAt,
+			LastFailureAt:            summary.LastFailureAt,
 			OpenUntil:                state.openUntil,
 			UpdatedAt:                state.updatedAt,
 		})
@@ -409,27 +496,92 @@ func trimEvents(events []channelCircuitEvent, now time.Time, window time.Duratio
 	return append([]channelCircuitEvent(nil), events[idx:]...)
 }
 
-func summarizeEvents(events []channelCircuitEvent) (requestCount int, failureCount int, slowCount int, totalLatency time.Duration, maxLatency time.Duration, lastLatency time.Duration, lastLatencyMode string) {
+func summarizeEvents(events []channelCircuitEvent) channelEventSummary {
+	summary := channelEventSummary{}
 	for _, event := range events {
-		requestCount++
-		if !event.success {
-			failureCount++
+		summary.RequestCount++
+		summary.Latencies = append(summary.Latencies, event.latency)
+		if event.stream {
+			summary.StreamRequestCount++
+			summary.StreamTotalLatency += event.latency
+			summary.StreamLatencies = append(summary.StreamLatencies, event.latency)
+			if event.latency > summary.StreamMaxLatency {
+				summary.StreamMaxLatency = event.latency
+			}
+		} else {
+			summary.NonStreamRequestCount++
+			summary.NonStreamTotalLatency += event.latency
+			summary.NonStreamLatencies = append(summary.NonStreamLatencies, event.latency)
+			if event.latency > summary.NonStreamMaxLatency {
+				summary.NonStreamMaxLatency = event.latency
+			}
+		}
+		if event.success {
+			summary.SuccessCount++
+			summary.LastSuccessAt = event.at
+			summary.LastSuccessLatency = event.latency
+			if event.stream {
+				summary.StreamSuccessCount++
+			} else {
+				summary.NonStreamSuccessCount++
+			}
+		} else {
+			summary.FailureCount++
+			summary.LastFailureAt = event.at
+			summary.LastFailureLatency = event.latency
+			if event.stream {
+				summary.StreamFailureCount++
+			} else {
+				summary.NonStreamFailureCount++
+			}
 		}
 		if event.slow {
-			slowCount++
+			summary.SlowCount++
+			if event.stream {
+				summary.StreamSlowCount++
+			} else {
+				summary.NonStreamSlowCount++
+			}
 		}
-		totalLatency += event.latency
-		if event.latency > maxLatency {
-			maxLatency = event.latency
+		summary.TotalLatency += event.latency
+		if event.latency > summary.MaxLatency {
+			summary.MaxLatency = event.latency
 		}
-		lastLatency = event.latency
+		summary.LastLatency = event.latency
 		if event.stream {
-			lastLatencyMode = "stream"
+			summary.LastLatencyMode = "stream"
 		} else {
-			lastLatencyMode = "non_stream"
+			summary.LastLatencyMode = "non_stream"
 		}
 	}
-	return requestCount, failureCount, slowCount, totalLatency, maxLatency, lastLatency, lastLatencyMode
+	return summary
+}
+
+func latencyPercentileMs(latencies []time.Duration, percentile float64) int64 {
+	if len(latencies) == 0 {
+		return 0
+	}
+
+	sorted := append([]time.Duration(nil), latencies...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i] < sorted[j]
+	})
+
+	switch {
+	case percentile <= 0:
+		return sorted[0].Milliseconds()
+	case percentile >= 1:
+		return sorted[len(sorted)-1].Milliseconds()
+	}
+
+	idx := int(math.Ceil(percentile*float64(len(sorted)))) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx].Milliseconds()
 }
 
 func isSlowEvent(latency time.Duration, stream bool, cfg CircuitBreakerConfig) bool {
