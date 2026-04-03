@@ -90,6 +90,86 @@ func TestTryChannelsOpensCircuitAfterBurstFailures(t *testing.T) {
 	}
 }
 
+func TestTryChannelsOpensCircuitWithinSingleRequestAfterRetryBurst(t *testing.T) {
+	badAttempts := 0
+	goodAttempts := 0
+	channels := []Channel{
+		{
+			Id:      1,
+			Name:    "bad",
+			BaseURL: "https://bad.example.com",
+			Enabled: true,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "bad-key", Value: "bad-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				badAttempts++
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"429"}}`)),
+				}, nil
+			},
+		},
+		{
+			Id:      2,
+			Name:    "good",
+			BaseURL: "https://good.example.com",
+			Enabled: true,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "good-key", Value: "good-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				goodAttempts++
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       http.NoBody,
+				}, nil
+			},
+		},
+	}
+
+	p := New(Config{
+		Retry: RetryConfig{
+			MaxAttempts: 5,
+			RetryOnResponse: func(ctx *Context, ch *Channel, code int, body []byte) bool {
+				return code == http.StatusTooManyRequests
+			},
+		},
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         3,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Second,
+			Cooldown:           time.Minute,
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	ctx := &Context{Request: req}
+	result := p.tryChannels(req, ctx, channels, p.cfg.Retry)
+	if result.successResp == nil {
+		t.Fatalf("first request should succeed on fallback channel")
+	}
+	writeSuccessfulPipelineResult(t, p, req, ctx, result)
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	ctx = &Context{Request: req}
+	result = p.tryChannels(req, ctx, channels, p.cfg.Retry)
+	if result.successResp == nil {
+		t.Fatalf("second request should skip open circuit and succeed on fallback channel")
+	}
+	writeSuccessfulPipelineResult(t, p, req, ctx, result)
+
+	if badAttempts != 3 {
+		t.Fatalf("badAttempts=%d, want=3 because breaker should open during first retry burst", badAttempts)
+	}
+	if goodAttempts != 2 {
+		t.Fatalf("goodAttempts=%d, want=2", goodAttempts)
+	}
+}
+
 func TestTryChannelsRecoversAfterCooldownProbeSuccess(t *testing.T) {
 	badAttempts := 0
 	goodAttempts := 0
@@ -191,6 +271,102 @@ func TestTryChannelsRecoversAfterCooldownProbeSuccess(t *testing.T) {
 	}
 	if goodAttempts != 3 {
 		t.Fatalf("goodAttempts=%d, want=3 because recovered channel should stop fallback", goodAttempts)
+	}
+}
+
+func TestTryChannelsHalfOpenProbeDoesNotHideFailureWithRetries(t *testing.T) {
+	badAttempts := 0
+	goodAttempts := 0
+	channels := []Channel{
+		{
+			Id:      1,
+			Name:    "bad",
+			BaseURL: "https://bad.example.com",
+			Enabled: true,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "bad-key", Value: "bad-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				badAttempts++
+				status := http.StatusTooManyRequests
+				if badAttempts >= 3 {
+					status = http.StatusOK
+				}
+				return &http.Response{
+					StatusCode: status,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"429"}}`)),
+				}, nil
+			},
+		},
+		{
+			Id:      2,
+			Name:    "good",
+			BaseURL: "https://good.example.com",
+			Enabled: true,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "good-key", Value: "good-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				goodAttempts++
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       http.NoBody,
+				}, nil
+			},
+		},
+	}
+
+	p := New(Config{
+		Retry: RetryConfig{
+			MaxAttempts: 3,
+			RetryOnResponse: func(ctx *Context, ch *Channel, code int, body []byte) bool {
+				return code == http.StatusTooManyRequests
+			},
+		},
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         1,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Second,
+			Cooldown:           20 * time.Millisecond,
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	ctx := &Context{Request: req}
+	result := p.tryChannels(req, ctx, channels, p.cfg.Retry)
+	if result.successResp == nil {
+		t.Fatalf("first request should succeed on fallback channel")
+	}
+	writeSuccessfulPipelineResult(t, p, req, ctx, result)
+
+	time.Sleep(40 * time.Millisecond)
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	ctx = &Context{Request: req}
+	result = p.tryChannels(req, ctx, channels, p.cfg.Retry)
+	if result.successResp == nil {
+		t.Fatalf("probe request should still fall back after first probe failure")
+	}
+	writeSuccessfulPipelineResult(t, p, req, ctx, result)
+
+	if badAttempts != 2 {
+		t.Fatalf("badAttempts=%d, want=2 because half-open probe should stop after first failed attempt", badAttempts)
+	}
+	if goodAttempts != 2 {
+		t.Fatalf("goodAttempts=%d, want=2 because fallback should be used for both requests", goodAttempts)
+	}
+
+	snapshots := p.breaker.Snapshot()
+	if len(snapshots) != 2 {
+		t.Fatalf("snapshot len=%d, want=2", len(snapshots))
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.ChannelName == "bad" && snapshot.Status != "open" {
+			t.Fatalf("bad channel status=%s, want=open", snapshot.Status)
+		}
 	}
 }
 
@@ -625,7 +801,7 @@ func TestChannelCircuitBreakerCooldownBackoffUntilRecovery(t *testing.T) {
 	}
 
 	now = now.Add(11 * time.Second)
-	if allowed, _ := breaker.Allow(ch); !allowed {
+	if allowed, _, _ := breaker.Allow(ch); !allowed {
 		t.Fatalf("channel should enter half-open after first cooldown")
 	}
 
@@ -638,7 +814,7 @@ func TestChannelCircuitBreakerCooldownBackoffUntilRecovery(t *testing.T) {
 	}
 
 	now = now.Add(21 * time.Second)
-	if allowed, _ := breaker.Allow(ch); !allowed {
+	if allowed, _, _ := breaker.Allow(ch); !allowed {
 		t.Fatalf("channel should enter half-open after second cooldown")
 	}
 

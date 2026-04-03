@@ -2,6 +2,7 @@ package failover
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,8 +71,9 @@ func classifySelectChannelsStatus(err error) int {
 func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, retryCfg RetryConfig) pipelineResult {
 	result := pipelineResult{}
 	for i := range channels {
+		probeMode := false
 		if p.breaker != nil {
-			if allowed, wait := p.breaker.Allow(&channels[i]); !allowed {
+			if allowed, wait, probe := p.breaker.Allow(&channels[i]); !allowed {
 				channelName := MaskChannelName(strconv.Itoa(channels[i].Id))
 				result.lastErr = fmt.Errorf("channel circuit open: [%s] %s", channelName, "CC")
 				p.logger().InfoCtx(r.Context(), "channel skipped by circuit breaker",
@@ -81,6 +83,8 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 					"retry_after", wait,
 				)
 				continue
+			} else {
+				probeMode = probe
 			}
 		}
 
@@ -92,33 +96,24 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 		if channels[i].Retry != nil {
 			channelRetryCfg = *channels[i].Retry
 		}
+		configuredMaxAttempts := channelRetryCfg.MaxAttempts
+		if probeMode && channelRetryCfg.MaxAttempts > 1 {
+			channelRetryCfg.MaxAttempts = 1
+			p.logger().InfoCtx(r.Context(), "channel half-open probe uses single attempt",
+				"channel", channels[i].Name,
+				"channel_type", channels[i].CType,
+				"channel_idx", i,
+				"configured_max_attempts", configuredMaxAttempts,
+			)
+		}
 		if channelRetryCfg.MaxAttempts <= 0 {
 			channelRetryCfg.MaxAttempts = 1
 		}
 
 		resp, err := p.tryChannel(r, ctx, &channels[i], channelRetryCfg)
-		latency, stream := circuitObservation(ctx)
 		if err != nil {
 			result.lastErr = err
 			p.handleChannelAttemptFailure(r, ctx, resp, err, &result.lastResp)
-			if p.breaker != nil && !IsContextDoneError(err) && p.shouldCountChannelFailureForCircuit(ctx, &channels[i], err) {
-				opened, reopen, wait, reason := p.breaker.RecordFailure(&channels[i], latency, stream, ctx.LastStatusCode)
-				if opened {
-					logMessage := "channel circuit opened"
-					if reopen {
-						logMessage = "channel circuit reopened"
-					}
-					p.logger().WarnCtx(r.Context(), logMessage,
-						"channel", channels[i].Name,
-						"channel_type", channels[i].CType,
-						"channel_idx", i,
-						"cooldown", wait,
-						"reason", reason,
-						"latency", latency,
-						"error", err,
-					)
-				}
-			}
 			if !p.shouldContinueToNextChannel(ctx, &channels[i], channelRetryCfg, err) {
 				return result
 			}
@@ -145,6 +140,44 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 	}
 
 	return result
+}
+
+func (p *Proxy) recordCircuitFailure(r *http.Request, ctx *Context, ch *Channel, err error) bool {
+	if p == nil || p.breaker == nil || ctx == nil || ch == nil || err == nil {
+		return false
+	}
+	if IsContextDoneError(err) || !p.shouldCountChannelFailureForCircuit(ctx, ch, err) {
+		return false
+	}
+
+	latency, stream := circuitObservation(ctx)
+	opened, reopen, wait, reason := p.breaker.RecordFailure(ch, latency, stream, ctx.LastStatusCode)
+	if !opened {
+		return false
+	}
+
+	logMessage := "channel circuit opened"
+	if reopen {
+		logMessage = "channel circuit reopened"
+	}
+
+	requestCtx := context.Background()
+	if r != nil {
+		requestCtx = r.Context()
+	} else if ctx.Request != nil {
+		requestCtx = ctx.Request.Context()
+	}
+
+	p.logger().WarnCtx(requestCtx, logMessage,
+		"channel", ch.Name,
+		"channel_type", ch.CType,
+		"channel_idx", ctx.ChannelIdx,
+		"cooldown", wait,
+		"reason", reason,
+		"latency", latency,
+		"error", err,
+	)
+	return true
 }
 
 func shouldCountChannelFailureForCircuit(ctx *Context, ch *Channel, err error) bool {

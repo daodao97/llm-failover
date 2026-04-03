@@ -119,9 +119,9 @@ func normalizeCircuitBreakerConfig(cfg CircuitBreakerConfig) CircuitBreakerConfi
 	return cfg
 }
 
-func (b *channelCircuitBreaker) Allow(ch *Channel) (bool, time.Duration) {
+func (b *channelCircuitBreaker) Allow(ch *Channel) (bool, time.Duration, bool) {
 	if b == nil || ch == nil {
-		return true, 0
+		return true, 0, false
 	}
 
 	b.mu.Lock()
@@ -133,21 +133,22 @@ func (b *channelCircuitBreaker) Allow(ch *Channel) (bool, time.Duration) {
 	state.updatedAt = now
 	if len(state.events) == 0 && !state.openUntil.After(now) && !state.halfOpen {
 		delete(b.states, channelCircuitKey(ch))
-		return true, 0
+		return true, 0, false
 	}
 
 	if state.openUntil.After(now) {
-		return false, time.Until(state.openUntil)
+		return false, time.Until(state.openUntil), false
 	}
 
 	if !state.openUntil.IsZero() {
 		if state.halfOpen {
-			return false, 0
+			return false, 0, true
 		}
 		state.halfOpen = true
+		return true, 0, true
 	}
 
-	return true, 0
+	return true, 0, false
 }
 
 func (b *channelCircuitBreaker) RecordSuccess(ch *Channel, latency time.Duration, stream bool) (opened bool, wait time.Duration, reason string) {

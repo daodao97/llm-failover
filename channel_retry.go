@@ -20,14 +20,18 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 
 	baseHeader, keys, internalHandler, err := p.prepareChannelAttempt(r, ctx, ch)
 	if err != nil {
-		return nil, wrapChannelError(ch, err)
+		wrapped := wrapChannelError(ch, err)
+		p.recordCircuitFailure(r, ctx, ch, wrapped)
+		return nil, wrapped
 	}
 	if internalHandler != nil {
 		resp, err := internalHandler(ctx)
 		if err == nil && resp == nil {
 			return nil, wrapChannelError(ch, errEmptyResponseInternalHandler)
 		}
-		return resp, wrapChannelError(ch, err)
+		wrapped := wrapChannelError(ch, err)
+		p.recordCircuitFailure(r, ctx, ch, wrapped)
+		return resp, wrapped
 	}
 
 	// 遍历所有 Key
@@ -69,6 +73,10 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 					emitAttemptError(err)
 					return nil, err
 				}
+				if p.recordCircuitFailure(r, ctx, ch, err) {
+					emitAttemptError(err)
+					return nil, wrapChannelError(ch, lastErr)
+				}
 				if p.shouldRetryOnExecutionError(r, ctx, ch, cfg, attempt, err, emitAttemptError) {
 					ctx.LastResponseBody = nil
 					continue
@@ -86,6 +94,11 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 			if decision.reason != "" {
 				var retryReason string
 				lastErr, retryReason = p.buildRetryError(ctx, resp, decision)
+				if p.recordCircuitFailure(r, ctx, ch, lastErr) {
+					resp.Body.Close()
+					emitAttemptError(lastErr)
+					return nil, wrapChannelError(ch, lastErr)
+				}
 				if attempt < cfg.MaxAttempts {
 					resp.Body.Close()
 					ctx.RetryReason = retryReason
@@ -104,6 +117,7 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 				lastErr = wrapChannelError(ch, fmt.Errorf("status: %d", resp.StatusCode))
 				ctx.LastStatusCode = resp.StatusCode
 				ctx.LastResponseHeader = resp.Header.Clone()
+				p.recordCircuitFailure(r, ctx, ch, lastErr)
 				emitAttemptError(lastErr)
 				return resp, lastErr
 			}
