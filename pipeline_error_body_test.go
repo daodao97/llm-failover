@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tidwall/gjson"
 )
@@ -291,6 +292,81 @@ func TestServeHTTPGeneratedErrorSanitizesUpstreamURL(t *testing.T) {
 		t.Fatalf("error.message should hide upstream url, got=%q", msg)
 	}
 	if !strings.Contains(msg, `Post "[upstream-url]": EOF`) {
+		t.Fatalf("error.message=%q", msg)
+	}
+}
+
+func TestServeHTTPPreservesRealUpstreamErrorWhenLaterChannelIsCircuitOpen(t *testing.T) {
+	first := Channel{
+		Id:      107,
+		Name:    "upstream-overloaded",
+		Enabled: true,
+		GetKeys: func(ctx *Context) []Key {
+			return []Key{{ID: "k1", Value: "v1"}}
+		},
+		Handler: func(ctx *Context) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header: http.Header{
+					"Content-Type": []string{"application/json"},
+				},
+				Body: io.NopCloser(strings.NewReader(`{"error":{"type":"<nil>","message":"system memory overloaded"}}`)),
+			}, nil
+		},
+		Retry: &RetryConfig{
+			MaxAttempts: 1,
+			RetryOnResponse: func(ctx *Context, ch *Channel, code int, body []byte) bool {
+				return code >= http.StatusTooManyRequests
+			},
+		},
+	}
+	second := Channel{
+		Id:      108,
+		Name:    "open-breaker",
+		Enabled: true,
+		GetKeys: func(ctx *Context) []Key {
+			return []Key{{ID: "k2", Value: "v2"}}
+		},
+		Handler: func(ctx *Context) (*http.Response, error) {
+			t.Fatal("open breaker channel should be skipped")
+			return nil, nil
+		},
+	}
+
+	p := New(Config{
+		Channels: []Channel{first, second},
+		Retry:    NoRetry(),
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         1,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Minute,
+			Cooldown:           time.Minute,
+		},
+	})
+
+	if p.breaker == nil {
+		t.Fatal("breaker should be initialized")
+	}
+	if opened, _, _, _ := p.breaker.RecordFailure(&second, 0, false, http.StatusBadGateway); !opened {
+		t.Fatal("expected second channel circuit to open")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want=%d", w.Code, http.StatusServiceUnavailable)
+	}
+
+	body := w.Body.String()
+	if strings.Contains(body, "channel circuit open") {
+		t.Fatalf("body should preserve real upstream error, got=%s", body)
+	}
+	msg := gjson.Get(body, "error.message").String()
+	if !strings.Contains(msg, "system memory overloaded") {
 		t.Fatalf("error.message=%q", msg)
 	}
 }

@@ -75,7 +75,9 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 		if p.breaker != nil {
 			if allowed, wait, probe := p.breaker.Allow(&channels[i]); !allowed {
 				channelName := MaskChannelName(strconv.Itoa(channels[i].Id))
-				result.lastErr = fmt.Errorf("channel circuit open: [%s] %s", channelName, "CC")
+				if result.lastErr == nil {
+					result.lastErr = fmt.Errorf("channel circuit open: [%s] %s", channelName, "CC")
+				}
 				p.logger().InfoCtx(r.Context(), "channel skipped by circuit breaker",
 					"channel", channels[i].Name,
 					"channel_type", channels[i].CType,
