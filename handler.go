@@ -48,6 +48,30 @@ func New(cfg Config) *Proxy {
 	}
 }
 
+// ResetChannelHealthStats 清空当前 Proxy 内熔断器维护的全部渠道统计和状态。
+func (p *Proxy) ResetChannelHealthStats() int {
+	if p == nil || p.breaker == nil {
+		return 0
+	}
+	return p.breaker.Reset()
+}
+
+// ResetChannelHealthStatsForChannel 清空当前 Proxy 内指定渠道的统计和状态。
+func (p *Proxy) ResetChannelHealthStatsForChannel(ch *Channel) bool {
+	if p == nil || p.breaker == nil || ch == nil {
+		return false
+	}
+	return p.breaker.ResetChannel(ch)
+}
+
+// ResetChannelHealthStatsByKey 按渠道 key 清空当前 Proxy 内指定渠道的统计和状态。
+func (p *Proxy) ResetChannelHealthStatsByKey(channelKey string) bool {
+	if p == nil || p.breaker == nil {
+		return false
+	}
+	return p.breaker.ResetChannelByKey(channelKey)
+}
+
 // ServeHTTP 实现 http.Handler 接口
 // 请求流程: 获取可用渠道 -> 按顺序尝试每个渠道 -> 成功则返回响应，全部失败则返回错误
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {

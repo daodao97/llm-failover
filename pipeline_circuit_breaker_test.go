@@ -1333,3 +1333,98 @@ func TestChannelCircuitBreakerSnapshotIncludesDetailedBreakdown(t *testing.T) {
 		t.Fatalf("consecutiveOpenCount=%d, want=0", snapshot.ConsecutiveOpenCount)
 	}
 }
+
+func TestProxyResetChannelHealthStats(t *testing.T) {
+	p := New(Config{
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         1,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Minute,
+			Cooldown:           time.Minute,
+		},
+	})
+
+	bad := &Channel{Id: 1, Name: "bad", BaseURL: "https://bad.example.com"}
+	good := &Channel{Id: 2, Name: "good", BaseURL: "https://good.example.com"}
+
+	if opened, _, _, _ := p.breaker.RecordFailure(bad, 0, false, http.StatusBadGateway); !opened {
+		t.Fatalf("bad failure should open circuit")
+	}
+	if opened, _, _, _ := p.breaker.RecordFailure(good, 0, false, http.StatusTooManyRequests); !opened {
+		t.Fatalf("good failure should open circuit")
+	}
+
+	if ok := p.ResetChannelHealthStatsForChannel(bad); !ok {
+		t.Fatalf("reset bad channel should succeed")
+	}
+
+	snapshots := p.breaker.Snapshot()
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshot len=%d, want=1 after per-channel reset", len(snapshots))
+	}
+	if snapshots[0].ChannelName != "good" {
+		t.Fatalf("remaining snapshot channel=%s, want=good", snapshots[0].ChannelName)
+	}
+
+	if allowed, _, _ := p.breaker.Allow(bad); !allowed {
+		t.Fatalf("bad channel should be closed after reset")
+	}
+	if allowed, _, _ := p.breaker.Allow(good); allowed {
+		t.Fatalf("good channel should remain open before overall reset")
+	}
+
+	if resetCount := p.ResetChannelHealthStats(); resetCount != 1 {
+		t.Fatalf("resetCount=%d, want=1", resetCount)
+	}
+	if snapshots := p.breaker.Snapshot(); len(snapshots) != 0 {
+		t.Fatalf("snapshot len=%d, want=0 after overall reset", len(snapshots))
+	}
+	if allowed, _, _ := p.breaker.Allow(good); !allowed {
+		t.Fatalf("good channel should be closed after overall reset")
+	}
+}
+
+func TestResetChannelHealthStatsByKeyAcrossBreakers(t *testing.T) {
+	ResetChannelHealthStats()
+
+	p1 := New(Config{
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         1,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Minute,
+			Cooldown:           time.Minute,
+		},
+		BreakerScope: "messages",
+	})
+	p2 := New(Config{
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         1,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Minute,
+			Cooldown:           time.Minute,
+		},
+		BreakerScope: "embeddings",
+	})
+
+	shared := &Channel{Id: 99, Name: "shared", BaseURL: "https://shared.example.com"}
+
+	if opened, _, _, _ := p1.breaker.RecordFailure(shared, 0, false, http.StatusBadGateway); !opened {
+		t.Fatalf("p1 failure should open circuit")
+	}
+	if opened, _, _, _ := p2.breaker.RecordFailure(shared, 0, false, http.StatusBadGateway); !opened {
+		t.Fatalf("p2 failure should open circuit")
+	}
+
+	if resetCount := ResetChannelHealthStatsByKey("id:99"); resetCount != 2 {
+		t.Fatalf("resetCount=%d, want=2", resetCount)
+	}
+	if allowed, _, _ := p1.breaker.Allow(shared); !allowed {
+		t.Fatalf("p1 shared channel should be closed after global reset")
+	}
+	if allowed, _, _ := p2.breaker.Allow(shared); !allowed {
+		t.Fatalf("p2 shared channel should be closed after global reset")
+	}
+}

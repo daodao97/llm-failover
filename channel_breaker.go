@@ -433,6 +433,41 @@ func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
 	return snapshots
 }
 
+func (b *channelCircuitBreaker) Reset() int {
+	if b == nil {
+		return 0
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	count := len(b.states)
+	b.states = make(map[string]*channelCircuitState)
+	return count
+}
+
+func (b *channelCircuitBreaker) ResetChannel(ch *Channel) bool {
+	if ch == nil {
+		return false
+	}
+	return b.ResetChannelByKey(channelCircuitKey(ch))
+}
+
+func (b *channelCircuitBreaker) ResetChannelByKey(channelKey string) bool {
+	if b == nil || channelKey == "" {
+		return false
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if _, ok := b.states[channelKey]; !ok {
+		return false
+	}
+	delete(b.states, channelKey)
+	return true
+}
+
 func (r *channelBreakerRegistry) register(b *channelCircuitBreaker) {
 	if b == nil {
 		return
@@ -444,6 +479,24 @@ func (r *channelBreakerRegistry) register(b *channelCircuitBreaker) {
 
 func ListChannelHealthSnapshots() []ChannelHealthSnapshot {
 	return globalChannelBreakerRegistry.snapshot()
+}
+
+// ResetChannelHealthStats 清空当前进程内所有熔断器的渠道统计和状态。
+func ResetChannelHealthStats() int {
+	return globalChannelBreakerRegistry.reset()
+}
+
+// ResetChannelHealthStatsForChannel 按渠道清空当前进程内所有熔断器的统计和状态。
+func ResetChannelHealthStatsForChannel(ch *Channel) int {
+	if ch == nil {
+		return 0
+	}
+	return globalChannelBreakerRegistry.resetChannelByKey(channelCircuitKey(ch))
+}
+
+// ResetChannelHealthStatsByKey 按渠道 key 清空当前进程内所有熔断器的统计和状态。
+func ResetChannelHealthStatsByKey(channelKey string) int {
+	return globalChannelBreakerRegistry.resetChannelByKey(channelKey)
 }
 
 func (r *channelBreakerRegistry) snapshot() []ChannelHealthSnapshot {
@@ -465,6 +518,40 @@ func (r *channelBreakerRegistry) snapshot() []ChannelHealthSnapshot {
 		return snapshots[i].ChannelKey < snapshots[j].ChannelKey
 	})
 	return snapshots
+}
+
+func (r *channelBreakerRegistry) reset() int {
+	if r == nil {
+		return 0
+	}
+
+	r.mu.RLock()
+	breakers := append([]*channelCircuitBreaker(nil), r.breakers...)
+	r.mu.RUnlock()
+
+	total := 0
+	for _, breaker := range breakers {
+		total += breaker.Reset()
+	}
+	return total
+}
+
+func (r *channelBreakerRegistry) resetChannelByKey(channelKey string) int {
+	if r == nil || channelKey == "" {
+		return 0
+	}
+
+	r.mu.RLock()
+	breakers := append([]*channelCircuitBreaker(nil), r.breakers...)
+	r.mu.RUnlock()
+
+	resetCount := 0
+	for _, breaker := range breakers {
+		if breaker.ResetChannelByKey(channelKey) {
+			resetCount++
+		}
+	}
+	return resetCount
 }
 
 func channelCircuitKey(ch *Channel) string {
