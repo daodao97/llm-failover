@@ -49,13 +49,19 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 		for attempt := 1; attempt <= cfg.MaxAttempts; attempt++ {
 			ctx.resetForAttempt(keyHeader)
 			ctx.Attempt = attempt
+			currentKey := &keys[keyIdx]
+			p.observer().OnAttemptStart(ctx, ch, currentKey)
 			emitAttemptError := func(err error) {
 				if p.cfg.OnAttemptError != nil {
 					p.cfg.OnAttemptError(ctx, err)
 				}
 			}
+			emitAttemptDone := func(resp *http.Response, err error, result AttemptResult) {
+				p.observer().OnAttemptDone(ctx, ch, currentKey, resp, err, result)
+			}
 
 			if err := r.Context().Err(); err != nil {
+				emitAttemptDone(nil, err, AttemptResultFailed)
 				return nil, err
 			}
 
@@ -75,17 +81,21 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 				lastErr = err
 				if IsContextDoneError(err) {
 					emitAttemptError(err)
+					emitAttemptDone(nil, err, AttemptResultFailed)
 					return nil, err
 				}
 				if shouldRecordAttemptFailureForCircuit(ch) && p.recordCircuitFailure(r, ctx, ch, err) {
 					emitAttemptError(err)
+					emitAttemptDone(nil, lastErr, AttemptResultFailed)
 					return nil, wrapChannelError(ch, lastErr)
 				}
 				if p.shouldRetryOnExecutionError(r, ctx, ch, cfg, attempt, err, emitAttemptError) {
 					ctx.LastResponseBody = nil
+					emitAttemptDone(nil, err, AttemptResultFailed)
 					continue
 				}
 				emitAttemptError(err)
+				emitAttemptDone(nil, err, AttemptResultFailed)
 				// 网络错误，尝试下一个 key
 				break
 			}
@@ -101,16 +111,20 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 				if shouldRecordAttemptFailureForCircuit(ch) && p.recordCircuitFailure(r, ctx, ch, lastErr) {
 					resp.Body.Close()
 					emitAttemptError(lastErr)
+					emitAttemptDone(resp, lastErr, AttemptResultFailed)
 					return nil, wrapChannelError(ch, lastErr)
 				}
 				if attempt < cfg.MaxAttempts {
 					resp.Body.Close()
 					ctx.RetryReason = retryReason
+					p.observer().OnRetry(ctx, ch, currentKey, retryReason)
 					emitAttemptError(lastErr)
+					emitAttemptDone(resp, lastErr, AttemptResultFailed)
 					sleep(r.Context(), backoff(cfg, attempt))
 					continue
 				}
 				emitAttemptError(lastErr)
+				emitAttemptDone(resp, lastErr, AttemptResultFailed)
 				// 当前 key 已用尽，尝试下一个 key
 				resp.Body.Close()
 				break
@@ -125,12 +139,14 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 					p.recordCircuitFailure(r, ctx, ch, lastErr)
 				}
 				emitAttemptError(lastErr)
+				emitAttemptDone(resp, lastErr, AttemptResultFailed)
 				return resp, lastErr
 			}
 
 			// 成功响应，更新状态码和响应头
 			ctx.LastStatusCode = resp.StatusCode
 			ctx.LastResponseHeader = resp.Header.Clone()
+			emitAttemptDone(resp, nil, AttemptResultSuccess)
 			return resp, nil
 		}
 	}
@@ -351,6 +367,7 @@ func (p *Proxy) shouldRetryOnExecutionError(r *http.Request, ctx *Context, ch *C
 		return false
 	}
 	ctx.RetryReason = fmt.Sprintf("error: %v", err)
+	p.observer().OnRetry(ctx, ch, ctx.CurrentKey, ctx.RetryReason)
 	emitAttemptError(err)
 	sleep(r.Context(), backoff(cfg, attempt))
 	return true

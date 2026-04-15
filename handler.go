@@ -72,6 +72,13 @@ func (p *Proxy) ResetChannelHealthStatsByKey(channelKey string) bool {
 	return p.breaker.ResetChannelByKey(channelKey)
 }
 
+func (p *Proxy) observer() Observer {
+	if p != nil && p.cfg.Observer != nil {
+		return p.cfg.Observer
+	}
+	return noopObserver{}
+}
+
 // ServeHTTP 实现 http.Handler 接口
 // 请求流程: 获取可用渠道 -> 按顺序尝试每个渠道 -> 成功则返回响应，全部失败则返回错误
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -80,16 +87,25 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := &Context{
 		Request: r,
 	}
+	obs := p.observer()
+	var doneErr error
+	obs.OnRequestStart(ctx)
+	defer func() {
+		obs.OnRequestDone(ctx, doneErr)
+	}()
 
 	if !p.prepareRequestBody(w, ctx) {
+		doneErr = errEmptyResponseTryChannels
 		return
 	}
 
 	channels, ok := p.selectChannels(w, r, ctx)
 	if !ok {
+		doneErr = errEmptyResponseTryChannels
 		return
 	}
 
 	result := p.tryChannels(r, ctx, channels, retryCfg)
 	p.writePipelineResponse(w, r, ctx, result)
+	doneErr = result.lastErr
 }

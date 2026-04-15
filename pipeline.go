@@ -78,6 +78,7 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 				if result.lastErr == nil {
 					result.lastErr = fmt.Errorf("channel circuit open: [%s] %s", channelName, "CC")
 				}
+				p.observer().OnChannelSkipped(ctx, &channels[i], "circuit_open")
 				p.logger().InfoCtx(r.Context(), "channel skipped by circuit breaker",
 					"channel", channels[i].Name,
 					"channel_type", channels[i].CType,
@@ -93,6 +94,7 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 		ctx.resetForChannel()
 		ctx.Channel = &channels[i]
 		ctx.ChannelIdx = i
+		p.observer().OnChannelSelected(ctx, &channels[i])
 
 		channelRetryCfg := retryCfg
 		if channels[i].Retry != nil {
@@ -172,6 +174,11 @@ func (p *Proxy) recordCircuitFailure(r *http.Request, ctx *Context, ch *Channel,
 	if reopen {
 		logMessage = "channel circuit reopened"
 	}
+	from := "closed"
+	if reopen {
+		from = "half_open"
+	}
+	p.observer().OnCircuitStateChange(ctx, ch, from, "open", reason)
 
 	requestCtx := context.Background()
 	if r != nil {
@@ -296,6 +303,7 @@ func (p *Proxy) recordChannelSuccess(r *http.Request, ctx *Context) {
 
 	latency, stream := circuitObservation(ctx)
 	if opened, wait, reason := p.breaker.RecordSuccess(ctx.Channel, latency, stream); opened {
+		p.observer().OnCircuitStateChange(ctx, ctx.Channel, "closed", "open", reason)
 		p.logger().WarnCtx(r.Context(), "channel circuit opened",
 			"channel", ctx.Channel.Name,
 			"channel_type", ctx.Channel.CType,
@@ -399,6 +407,7 @@ func (p *Proxy) writeUpstreamErrorResponse(w http.ResponseWriter, r *http.Reques
 	if p.cfg.OnError != nil {
 		p.cfg.OnError(ctx, errResp)
 	}
+	p.observer().OnFinalError(ctx, errResp)
 
 	p.writeErrorResponse(w, errResp)
 	return true
