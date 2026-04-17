@@ -60,6 +60,35 @@ type PrometheusObserverOptions struct {
 	TTFBBuckets    []float64
 }
 
+// ProtocolPrometheusObserverOptions 是面向常见“按协议打同一套指标”场景的快捷配置。
+//
+// 它在通用 PrometheusObserverOptions 之上进一步约定：
+// 1. protocol 是固定字符串，而不是每次从 Context 动态提取
+// 2. channel/channel_type 走一套默认字段提取
+// 3. 接入方只需提供必要的归一化函数，而不必自己再写一遍完整 labeler
+type ProtocolPrometheusObserverOptions struct {
+	Registerer prometheus.Registerer
+	Namespace  string
+	Subsystem  string
+
+	Protocol string
+
+	// NormalizeLabel 用于归一化 protocol/channel/channel_type 等通用 label。
+	// 为空时使用库内默认 normalizePrometheusLabel。
+	NormalizeLabel func(v string, fallback string) string
+	// NormalizeRetryReason / NormalizeErrorType 允许业务侧复用既有口径。
+	// 为空时退回到通用 label 归一化。
+	NormalizeRetryReason func(reason string) string
+	NormalizeErrorType   func(errType string) string
+
+	RateLimitClassifier PrometheusRateLimitClassifier
+
+	DNSBuckets     []float64
+	ConnectBuckets []float64
+	TLSBuckets     []float64
+	TTFBBuckets    []float64
+}
+
 // prometheusObserver 是 Observer 的 Prometheus 实现。
 //
 // 它的职责很窄：
@@ -83,6 +112,13 @@ type prometheusObserver struct {
 }
 
 type defaultPrometheusLabeler struct{}
+
+type protocolPrometheusLabeler struct {
+	protocol             string
+	normalizeLabel       func(v string, fallback string) string
+	normalizeRetryReason func(reason string) string
+	normalizeErrorType   func(errType string) string
+}
 
 // 默认实现只提供最保守的 fallback，避免调用方未注入 labeler 时直接 panic。
 func (defaultPrometheusLabeler) Protocol(*Context) string {
@@ -119,12 +155,79 @@ func (defaultPrometheusLabeler) ErrorType(errType string) string {
 	return normalizePrometheusLabel(errType, "unknown")
 }
 
+func (l protocolPrometheusLabeler) Protocol(*Context) string {
+	return l.normalizeLabel(l.protocol, "unknown")
+}
+
+func (l protocolPrometheusLabeler) Channel(_ *Context, ch *Channel) string {
+	if ch == nil {
+		return "unknown"
+	}
+	return l.normalizeLabel(ch.Name, "unknown")
+}
+
+func (l protocolPrometheusLabeler) ChannelType(_ *Context, ch *Channel) string {
+	if ch == nil {
+		return "unknown"
+	}
+	return l.normalizeLabel(string(ch.CType), "unknown")
+}
+
+func (l protocolPrometheusLabeler) RetryReason(reason string) string {
+	if l.normalizeRetryReason != nil {
+		return l.normalizeRetryReason(reason)
+	}
+	return l.normalizeLabel(reason, "unknown")
+}
+
+func (l protocolPrometheusLabeler) ErrorType(errType string) string {
+	if l.normalizeErrorType != nil {
+		return l.normalizeErrorType(errType)
+	}
+	return l.normalizeLabel(errType, "unknown")
+}
+
 func defaultPrometheusRateLimitClassifier(_ *Context, _ *Channel, resp *http.Response, _ error) (bool, string) {
 	// 默认只把显式的 HTTP 429 记作上游限流命中。
 	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 		return true, "upstream"
 	}
 	return false, ""
+}
+
+// NewProtocolPrometheusObserver 为“一个协议复用一套固定指标口径”的场景提供快捷工厂。
+//
+// 典型用法是业务侧只传：
+// 1. Protocol，例如 `claude`
+// 2. Namespace / Subsystem，例如 `xproxy/proxy`
+// 3. 自己已有的 normalize 函数
+// 4. 可选的限流判定策略
+//
+// 这样可以把原本散落在业务仓库里的薄适配层继续沉到库里。
+func NewProtocolPrometheusObserver(opts ProtocolPrometheusObserverOptions) Observer {
+	normalizeLabel := opts.NormalizeLabel
+	if normalizeLabel == nil {
+		normalizeLabel = normalizePrometheusLabel
+	}
+
+	labeler := protocolPrometheusLabeler{
+		protocol:             opts.Protocol,
+		normalizeLabel:       normalizeLabel,
+		normalizeRetryReason: opts.NormalizeRetryReason,
+		normalizeErrorType:   opts.NormalizeErrorType,
+	}
+
+	return NewPrometheusObserver(PrometheusObserverOptions{
+		Registerer:          opts.Registerer,
+		Namespace:           opts.Namespace,
+		Subsystem:           opts.Subsystem,
+		Labeler:             labeler,
+		RateLimitClassifier: opts.RateLimitClassifier,
+		DNSBuckets:          opts.DNSBuckets,
+		ConnectBuckets:      opts.ConnectBuckets,
+		TLSBuckets:          opts.TLSBuckets,
+		TTFBBuckets:         opts.TTFBBuckets,
+	})
 }
 
 // NewPrometheusObserver 创建官方 Prometheus observer。
