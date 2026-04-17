@@ -10,7 +10,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// PrometheusLabeler controls how request/channel/error metadata is mapped to metric labels.
+// PrometheusLabeler 用来把 failover 运行时里的领域信息映射成 Prometheus label。
+//
+// 这里刻意不把 protocol/channel/error_type 等标签逻辑写死在库里，
+// 因为不同接入方的口径并不相同：
+// 1. 有的系统按协议区分 `claude/gemini/codex`
+// 2. 有的系统按业务线区分
+// 3. 有的系统希望对 reason / error_type 再做一次归一化
+//
+// 因此官方 observer 只负责“在正确的事件点上打指标”，
+// 而 label 的具体取值交给外部决定。
 type PrometheusLabeler interface {
 	Protocol(ctx *Context) string
 	Channel(ctx *Context, ch *Channel) string
@@ -19,23 +28,44 @@ type PrometheusLabeler interface {
 	ErrorType(errType string) string
 }
 
-// PrometheusRateLimitClassifier decides whether a completed attempt should count as a rate-limit hit.
+// PrometheusRateLimitClassifier 决定一次 attempt 完成后，是否应额外记为“限流命中”。
+//
+// 之所以单独抽这个函数，而不是直接把 429 写死，
+// 是因为不同系统对 rate limit 的定义并不完全一样：
+// 1. 只把 HTTP 429 视为限流
+// 2. 某些上游会在 403/400 body 里表达 quota exhausted
+// 3. 某些业务只想统计 pool 渠道上的限流，而忽略 third 渠道
 type PrometheusRateLimitClassifier func(ctx *Context, ch *Channel, resp *http.Response, err error) (hit bool, scope string)
 
+// PrometheusObserverOptions 控制官方 Prometheus observer 的注册位置和标签策略。
+//
+// 这里不暴露每个指标名的自定义能力，是为了保持官方 observer 的可维护性；
+// 真正需要变化的，通常是 registerer、label 提取和桶配置。
 type PrometheusObserverOptions struct {
+	// Registerer 允许接入方注入自定义 registry。
+	// 为空时使用 prometheus.DefaultRegisterer。
 	Registerer prometheus.Registerer
-	Namespace  string
-	Subsystem  string
+	// Namespace / Subsystem 用于与现有指标命名体系对齐。
+	Namespace string
+	Subsystem string
 
 	Labeler             PrometheusLabeler
 	RateLimitClassifier PrometheusRateLimitClassifier
 
+	// 这些 buckets 只覆盖网络阶段耗时；
+	// 如果为空，则使用一组面向代理场景的默认桶。
 	DNSBuckets     []float64
 	ConnectBuckets []float64
 	TLSBuckets     []float64
 	TTFBBuckets    []float64
 }
 
+// prometheusObserver 是 Observer 的 Prometheus 实现。
+//
+// 它的职责很窄：
+// 1. 在 pipeline 的关键事件点累加/观测指标
+// 2. 复用外部给出的 label 策略
+// 3. 避免把 Prometheus collector 的重复注册问题泄漏给上层
 type prometheusObserver struct {
 	labeler             PrometheusLabeler
 	rateLimitClassifier PrometheusRateLimitClassifier
@@ -54,6 +84,7 @@ type prometheusObserver struct {
 
 type defaultPrometheusLabeler struct{}
 
+// 默认实现只提供最保守的 fallback，避免调用方未注入 labeler 时直接 panic。
 func (defaultPrometheusLabeler) Protocol(*Context) string {
 	return "unknown"
 }
@@ -89,12 +120,19 @@ func (defaultPrometheusLabeler) ErrorType(errType string) string {
 }
 
 func defaultPrometheusRateLimitClassifier(_ *Context, _ *Channel, resp *http.Response, _ error) (bool, string) {
+	// 默认只把显式的 HTTP 429 记作上游限流命中。
 	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 		return true, "upstream"
 	}
 	return false, ""
 }
 
+// NewPrometheusObserver 创建官方 Prometheus observer。
+//
+// 设计上有两个关键点：
+//  1. collector 在这里统一构造，避免每个接入方重复实现同一套指标
+//  2. register 阶段允许“重复创建、复用已注册 collector”，这样业务侧可以放心地在
+//     handler 构造路径、测试环境甚至多次初始化场景中调用，而不会因重复注册直接 panic
 func NewPrometheusObserver(opts PrometheusObserverOptions) Observer {
 	registerer := opts.Registerer
 	if registerer == nil {
@@ -203,6 +241,13 @@ func NewPrometheusObserver(opts PrometheusObserverOptions) Observer {
 	return observer.registerOrReuse(registerer)
 }
 
+// registerOrReuse 负责把本 observer 持有的 collector 注册到目标 registerer。
+//
+// 如果同名 collector 已注册，则直接复用已有实例。
+// 这样做的原因是：
+// 1. Prometheus 的默认 registerer 是进程级全局单例
+// 2. 很多项目会在测试里反复构造 handler / proxy
+// 3. 如果每次都 MustRegister，同名指标会立刻 panic
 func (o *prometheusObserver) registerOrReuse(registerer prometheus.Registerer) *prometheusObserver {
 	o.channelAttemptTotal = registerCounterVec(registerer, o.channelAttemptTotal)
 	o.retryTotal = registerCounterVec(registerer, o.retryTotal)
@@ -216,6 +261,11 @@ func (o *prometheusObserver) registerOrReuse(registerer prometheus.Registerer) *
 	return o
 }
 
+// registerCounterVec / registerHistogramVec 封装“注册或复用”的通用逻辑。
+//
+// 这里不静默吞掉所有错误，只对白名单情况 AlreadyRegistered 做复用；
+// 其他错误依旧直接 panic，因为那通常意味着真正的配置错误，
+// 比如同名 collector 的类型或标签集合不一致。
 func registerCounterVec(registerer prometheus.Registerer, collector *prometheus.CounterVec) *prometheus.CounterVec {
 	if err := registerer.Register(collector); err != nil {
 		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
@@ -250,6 +300,15 @@ func (o *prometheusObserver) OnChannelSkipped(*Context, *Channel, string) {}
 
 func (o *prometheusObserver) OnAttemptStart(*Context, *Channel, *Key) {}
 
+// OnAttemptDone 是这一版 observer 的核心事件点。
+//
+// 这里统一完成 4 类观测：
+// 1. attempt 成败计数
+// 2. 上游 HTTP 状态码计数
+// 3. 限流命中计数
+// 4. 网络阶段耗时直方图
+//
+// 这样上层业务就不需要再在 AfterProxy / OnAttemptError 等多个 hook 里手工拼指标。
 func (o *prometheusObserver) OnAttemptDone(ctx *Context, ch *Channel, _ *Key, resp *http.Response, err error, result AttemptResult) {
 	protocol, channel, channelType := o.labelValues(ctx, ch)
 	o.channelAttemptTotal.WithLabelValues(protocol, channel, channelType, normalizePrometheusLabel(string(result), "unknown")).Inc()
@@ -258,6 +317,8 @@ func (o *prometheusObserver) OnAttemptDone(ctx *Context, ch *Channel, _ *Key, re
 	if resp != nil {
 		statusCode = resp.StatusCode
 	} else if ctx != nil && ctx.LastStatusCode > 0 {
+		// 某些失败路径没有可用的 resp，但 ctx 上仍保留了最后一次状态码，
+		// 这里优先复用它，尽量避免丢指标。
 		statusCode = ctx.LastStatusCode
 	}
 	if statusCode > 0 {
@@ -284,6 +345,7 @@ func (o *prometheusObserver) OnAttemptDone(ctx *Context, ch *Channel, _ *Key, re
 }
 
 func (o *prometheusObserver) OnRetry(ctx *Context, _ *Channel, _ *Key, reason string) {
+	// Retry 事件是框架确认“要重试”时触发的，比在 BeforeAttempt 里用 attempt>1 推断更准确。
 	protocol := normalizePrometheusLabel(o.labeler.Protocol(ctx), "unknown")
 	o.retryTotal.WithLabelValues(protocol, o.labeler.RetryReason(reason)).Inc()
 }
@@ -292,6 +354,11 @@ func (o *prometheusObserver) OnCircuitStateChange(*Context, *Channel, string, st
 
 func (o *prometheusObserver) OnSSEEvent(*Context, *Channel, *SSEEvent) {}
 
+// OnFinalError 用于统计“整个 pipeline 最终失败”，而不是单次 attempt 失败。
+//
+// 这和 channel_attempt_total 的语义不同：
+// 1. channel_attempt_total 关注每次尝试
+// 2. final_failure_total 关注对调用方可见的最终失败结果
 func (o *prometheusObserver) OnFinalError(ctx *Context, errResp *ErrorResponse) {
 	protocol := normalizePrometheusLabel(o.labeler.Protocol(ctx), "unknown")
 	errType := ""
@@ -309,6 +376,7 @@ func (o *prometheusObserver) OnFinalError(ctx *Context, errResp *ErrorResponse) 
 	o.finalFailureTotal.WithLabelValues(protocol, o.labeler.ErrorType(errType), strconv.Itoa(statusCode)).Inc()
 }
 
+// labelValues 统一做一层 fallback + normalize，确保最终打到 Prometheus 的 label 可控。
 func (o *prometheusObserver) labelValues(ctx *Context, ch *Channel) (protocol string, channel string, channelType string) {
 	protocol = normalizePrometheusLabel(o.labeler.Protocol(ctx), "unknown")
 	channel = normalizePrometheusLabel(o.labeler.Channel(ctx, ch), "unknown")
@@ -317,6 +385,7 @@ func (o *prometheusObserver) labelValues(ctx *Context, ch *Channel) (protocol st
 }
 
 func observeDuration(vec *prometheus.HistogramVec, protocol string, channel string, d time.Duration) {
+	// 只有正数耗时才有观测意义；零值通常表示该阶段未发生或未成功采集。
 	if d <= 0 {
 		return
 	}
@@ -330,6 +399,13 @@ func nonEmptyBuckets(buckets []float64, fallback []float64) []float64 {
 	return fallback
 }
 
+// normalizePrometheusLabel 把任意输入收敛为适合作为 label value 的稳定字符串。
+//
+// 这里做的事情包括：
+// 1. trim + lower
+// 2. 非字母数字统一折叠成单个下划线
+// 3. 去掉前后下划线
+// 4. 限制最大长度，避免把高基数原始字符串直接打进指标
 func normalizePrometheusLabel(v string, fallback string) string {
 	v = strings.TrimSpace(strings.ToLower(v))
 	if v == "" {
