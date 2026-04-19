@@ -20,6 +20,7 @@ type Config struct {
 	Retry          RetryConfig
 	Client         *http.Client
 	Logger         Logger                            // 可选日志接口，默认 no-op
+	Observer       Observer                          // 可选可观测接口，默认 no-op
 	ErrorBody      func(errType, message string) any // 自定义错误响应体结构，返回的对象会被 JSON 编码
 	CircuitBreaker CircuitBreakerConfig
 	BreakerScope   string

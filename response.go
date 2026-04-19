@@ -90,10 +90,15 @@ func (p *Proxy) streamSSEPassthrough(w http.ResponseWriter, body io.Reader, ctx 
 		if event.Event == "" && event.Data == "" {
 			return
 		}
+		var channel *Channel
+		if ctx != nil {
+			channel = ctx.Channel
+		}
 		if !firstEventSent && ctx.Stats != nil {
 			ctx.Stats.FirstEventTime = time.Since(ctx.Stats.RequestStart)
 			firstEventSent = true
 		}
+		p.observer().OnSSEEvent(ctx, channel, &event)
 		if p.cfg.OnSSE != nil {
 			p.cfg.OnSSE(ctx, &event)
 		}
@@ -188,10 +193,15 @@ func (p *Proxy) streamSSEWithTransform(w http.ResponseWriter, body io.Reader, ct
 		}
 		for i := range events {
 			ev := events[i]
+			var channel *Channel
+			if ctx != nil {
+				channel = ctx.Channel
+			}
 			if (ev.Event != "" || ev.Data != "") && !firstEventSent && ctx.Stats != nil {
 				ctx.Stats.FirstEventTime = time.Since(ctx.Stats.RequestStart)
 				firstEventSent = true
 			}
+			p.observer().OnSSEEvent(ctx, channel, &ev)
 			if p.cfg.OnSSE != nil && (ev.Event != "" || ev.Data != "") {
 				p.cfg.OnSSE(ctx, &ev)
 			}
@@ -313,6 +323,7 @@ func (p *Proxy) writeGeneratedErrorResponse(w http.ResponseWriter, ctx *Context,
 	if p.cfg.OnError != nil && ctx.Channel != nil {
 		p.cfg.OnError(ctx, errResp)
 	}
+	p.observer().OnFinalError(ctx, errResp)
 
 	p.writeErrorResponse(w, errResp)
 }
