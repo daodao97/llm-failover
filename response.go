@@ -67,7 +67,7 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response, ctx *C
 
 // streamSSE 处理 SSE 流式响应，解析事件并调用 OnSSE 钩子
 func (p *Proxy) streamSSE(w http.ResponseWriter, body io.Reader, ctx *Context) {
-	if p.cfg.TransformSSE == nil {
+	if p.cfg.TransformSSE == nil && p.cfg.FilterSSE == nil {
 		p.streamSSEPassthrough(w, body, ctx)
 		return
 	}
@@ -187,15 +187,21 @@ func (p *Proxy) streamSSEWithTransform(w http.ResponseWriter, body io.Reader, ct
 			return
 		}
 
-		events := p.cfg.TransformSSE(ctx, event)
-		if len(events) == 0 {
-			events = []SSEEvent{event}
+		events := []SSEEvent{event}
+		if p.cfg.TransformSSE != nil {
+			events = p.cfg.TransformSSE(ctx, event)
+			if len(events) == 0 {
+				events = []SSEEvent{event}
+			}
 		}
 		for i := range events {
 			ev := events[i]
 			var channel *Channel
 			if ctx != nil {
 				channel = ctx.Channel
+			}
+			if p.cfg.FilterSSE != nil && !p.cfg.FilterSSE(ctx, ev) {
+				continue
 			}
 			if (ev.Event != "" || ev.Data != "") && !firstEventSent && ctx.Stats != nil {
 				ctx.Stats.FirstEventTime = time.Since(ctx.Stats.RequestStart)

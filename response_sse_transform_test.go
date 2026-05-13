@@ -54,6 +54,68 @@ func TestStreamSSEWithTransformSplitsEvents(t *testing.T) {
 	}
 }
 
+func TestStreamSSEWithFilterDropsEventsBeforeWrite(t *testing.T) {
+	var dropped int
+	p := &Proxy{
+		cfg: Config{
+			FilterSSE: func(_ *Context, event SSEEvent) bool {
+				if event.Data == "" || gjson.Valid(event.Data) {
+					return true
+				}
+				dropped++
+				return false
+			},
+		},
+	}
+
+	input := strings.Join([]string{
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","delta":{"text":"ok"}}`,
+		"",
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","delta":{"text":"broken}`,
+		"",
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	ctx := &Context{Stats: &Stats{RequestStart: time.Now()}}
+	p.streamSSE(rec, strings.NewReader(input), ctx)
+
+	out := rec.Body.String()
+	if dropped != 1 {
+		t.Fatalf("expected 1 dropped event, got %d", dropped)
+	}
+	if strings.Contains(out, "broken") {
+		t.Fatalf("invalid SSE data should be dropped before write, got output: %s", out)
+	}
+	if !strings.Contains(out, `"text":"ok"`) {
+		t.Fatalf("valid SSE data should pass through, got output: %s", out)
+	}
+}
+
+func TestStreamSSEWithFilterDropsPartialEventAtEOF(t *testing.T) {
+	p := &Proxy{
+		cfg: Config{
+			FilterSSE: func(_ *Context, event SSEEvent) bool {
+				return event.Data == "" || gjson.Valid(event.Data)
+			},
+		},
+	}
+
+	input := strings.Join([]string{
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","delta":{"text":"unterminated}`,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	ctx := &Context{Stats: &Stats{RequestStart: time.Now()}}
+	p.streamSSE(rec, strings.NewReader(input), ctx)
+
+	if out := rec.Body.String(); strings.Contains(out, "unterminated") {
+		t.Fatalf("partial invalid SSE at EOF should be dropped, got output: %s", out)
+	}
+}
+
 func TestParseSSEBlockCollectsMultiDataLines(t *testing.T) {
 	event := parseSSEBlock([]string{
 		"event: content_block_delta",

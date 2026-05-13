@@ -39,7 +39,8 @@ type Config struct {
 	OnChannelFail  func(ctx *Context, err error)
 	OnBody         func(ctx *Context, body []byte)
 	OnSSE          func(ctx *Context, event *SSEEvent)
-	TransformSSE   func(ctx *Context, event SSEEvent) []SSEEvent
+	FilterSSE      func(ctx *Context, event SSEEvent) bool       // Return false to drop the SSE event before writing it.
+	TransformSSE   func(ctx *Context, event SSEEvent) []SSEEvent // Empty result keeps the original event.
 	OnError        func(ctx *Context, err *ErrorResponse)
 }
 
