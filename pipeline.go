@@ -72,7 +72,7 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 	result := pipelineResult{}
 	for i := range channels {
 		probeMode := false
-		if p.breaker != nil {
+		if p.breaker != nil && !p.isCircuitBreakerWhitelisted(&channels[i]) {
 			if allowed, wait, probe := p.breaker.Allow(&channels[i]); !allowed {
 				channelName := MaskChannelName(strconv.Itoa(channels[i].Id))
 				if result.lastErr == nil {
@@ -158,6 +158,9 @@ func shouldRecordAttemptFailureForCircuit(ch *Channel) bool {
 
 func (p *Proxy) recordCircuitFailure(r *http.Request, ctx *Context, ch *Channel, err error) bool {
 	if p == nil || p.breaker == nil || ctx == nil || ch == nil || err == nil {
+		return false
+	}
+	if p.isCircuitBreakerWhitelisted(ch) {
 		return false
 	}
 	if IsContextDoneError(err) || !p.shouldCountChannelFailureForCircuit(ctx, ch, err) {
@@ -300,6 +303,9 @@ func (p *Proxy) recordChannelSuccess(r *http.Request, ctx *Context) {
 	if p == nil || p.breaker == nil || ctx == nil || ctx.Channel == nil {
 		return
 	}
+	if p.isCircuitBreakerWhitelisted(ctx.Channel) {
+		return
+	}
 
 	latency, stream := circuitObservation(ctx)
 	if opened, wait, reason := p.breaker.RecordSuccess(ctx.Channel, latency, stream); opened {
@@ -313,6 +319,41 @@ func (p *Proxy) recordChannelSuccess(r *http.Request, ctx *Context) {
 			"latency", latency,
 		)
 	}
+}
+
+func (p *Proxy) isCircuitBreakerWhitelisted(ch *Channel) bool {
+	if p == nil || ch == nil {
+		return false
+	}
+	for _, item := range p.cfg.CircuitBreakerWhitelist {
+		if circuitBreakerWhitelistMatch(item, ch) {
+			return true
+		}
+	}
+	return false
+}
+
+func circuitBreakerWhitelistMatch(item string, ch *Channel) bool {
+	if ch == nil {
+		return false
+	}
+	item = strings.TrimSpace(item)
+	if item == "" {
+		return false
+	}
+	if item == channelCircuitKey(ch) {
+		return true
+	}
+	if ch.Id > 0 && item == strconv.Itoa(ch.Id) {
+		return true
+	}
+	if ch.Name != "" && item == ch.Name {
+		return true
+	}
+	if ch.BaseURL != "" && item == ch.BaseURL {
+		return true
+	}
+	return false
 }
 
 func circuitObservation(ctx *Context) (time.Duration, bool) {

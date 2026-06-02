@@ -24,6 +24,9 @@ type Config struct {
 	ErrorBody      func(errType, message string) any // 自定义错误响应体结构，返回的对象会被 JSON 编码
 	CircuitBreaker CircuitBreakerConfig
 	BreakerScope   string
+	// CircuitBreakerWhitelist 配置不参与熔断的渠道。
+	// 支持 channel key（如 id:1、name:primary、url:https://...），也兼容裸 ID 和渠道名。
+	CircuitBreakerWhitelist []string
 	// ShouldCountFailureForCircuit 允许业务层自定义哪些失败应计入熔断。
 	// 返回 true 表示将本次失败记入熔断窗口；返回 false 表示忽略。
 	// 为 nil 时使用框架默认规则。

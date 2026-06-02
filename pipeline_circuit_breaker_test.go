@@ -90,6 +90,85 @@ func TestTryChannelsOpensCircuitAfterBurstFailures(t *testing.T) {
 	}
 }
 
+func TestTryChannelsCircuitBreakerWhitelistByName(t *testing.T) {
+	badAttempts := 0
+	goodAttempts := 0
+	channels := []Channel{
+		{
+			Id:      1,
+			Name:    "bad",
+			BaseURL: "https://bad.example.com",
+			Enabled: true,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "bad-key", Value: "bad-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				badAttempts++
+				return &http.Response{
+					StatusCode: http.StatusBadGateway,
+					Header:     make(http.Header),
+					Body:       http.NoBody,
+				}, nil
+			},
+		},
+		{
+			Id:      2,
+			Name:    "good",
+			BaseURL: "https://good.example.com",
+			Enabled: true,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "good-key", Value: "good-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				goodAttempts++
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       http.NoBody,
+				}, nil
+			},
+		},
+	}
+
+	p := New(Config{
+		Retry: NoRetry(),
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         2,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Second,
+			Cooldown:           time.Minute,
+		},
+		CircuitBreakerWhitelist: []string{"bad"},
+		ShouldCountFailureForCircuit: func(ctx *Context, ch *Channel, err error) bool {
+			return ch != nil && ch.Name == "bad"
+		},
+	})
+
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+		ctx := &Context{Request: req}
+
+		result := p.tryChannels(req, ctx, channels, NoRetry())
+		if result.successResp == nil {
+			t.Fatalf("request %d should succeed on fallback channel", i+1)
+		}
+		writeSuccessfulPipelineResult(t, p, req, ctx, result)
+	}
+
+	if badAttempts != 3 {
+		t.Fatalf("badAttempts=%d, want=3 because whitelisted channel should not open circuit", badAttempts)
+	}
+	if goodAttempts != 3 {
+		t.Fatalf("goodAttempts=%d, want=3", goodAttempts)
+	}
+	for _, snapshot := range p.breaker.Snapshot() {
+		if snapshot.ChannelName == "bad" {
+			t.Fatalf("whitelisted channel should not be recorded in breaker snapshot: %+v", snapshot)
+		}
+	}
+}
+
 func TestTryChannelsOpensCircuitWithinSingleRequestAfterRetryBurst(t *testing.T) {
 	badAttempts := 0
 	goodAttempts := 0
