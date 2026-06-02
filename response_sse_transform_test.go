@@ -36,6 +36,7 @@ func TestStreamSSEWithTransformSplitsEvents(t *testing.T) {
 		"event: content_block_delta",
 		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello world"}}`,
 		"",
+		"",
 	}, "\n")
 
 	rec := httptest.NewRecorder()
@@ -74,6 +75,7 @@ func TestStreamSSEWithFilterDropsEventsBeforeWrite(t *testing.T) {
 		"",
 		"event: content_block_delta",
 		`data: {"type":"content_block_delta","delta":{"text":"broken}`,
+		"",
 		"",
 	}, "\n")
 
@@ -116,6 +118,41 @@ func TestStreamSSEWithFilterDropsPartialEventAtEOF(t *testing.T) {
 	}
 }
 
+func TestStreamSSEWithTransformDropsIncompleteEventAtEOFBeforeHooks(t *testing.T) {
+	var transformed, filtered, observed int
+	p := &Proxy{
+		cfg: Config{
+			TransformSSE: func(_ *Context, event SSEEvent) []SSEEvent {
+				transformed++
+				return []SSEEvent{event}
+			},
+			FilterSSE: func(_ *Context, event SSEEvent) bool {
+				filtered++
+				return true
+			},
+			OnSSE: func(_ *Context, event *SSEEvent) {
+				observed++
+			},
+		},
+	}
+
+	input := strings.Join([]string{
+		"event: content_block_delta",
+		`data: {"type":"content_block_delta","delta":{"text":"complete json but no blank line"}}`,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	ctx := &Context{Stats: &Stats{RequestStart: time.Now()}}
+	p.streamSSE(rec, strings.NewReader(input), ctx)
+
+	if out := rec.Body.String(); out != "" {
+		t.Fatalf("incomplete SSE event at EOF should not be written, got output: %s", out)
+	}
+	if transformed != 0 || filtered != 0 || observed != 0 {
+		t.Fatalf("incomplete SSE event should not reach hooks, transformed=%d filtered=%d observed=%d", transformed, filtered, observed)
+	}
+}
+
 func TestParseSSEBlockCollectsMultiDataLines(t *testing.T) {
 	event := parseSSEBlock([]string{
 		"event: content_block_delta",
@@ -141,6 +178,7 @@ func TestStreamSSEPassthroughHandlesLargeEvent(t *testing.T) {
 	input := strings.Join([]string{
 		"event: response.completed",
 		`data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"` + largeText + `"}]}]}}`,
+		"",
 		"",
 	}, "\n")
 
@@ -173,6 +211,7 @@ func TestStreamSSEWithTransformHandlesLargeEvent(t *testing.T) {
 	input := strings.Join([]string{
 		"event: content_block_delta",
 		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"` + largeText + `"}}`,
+		"",
 		"",
 	}, "\n")
 

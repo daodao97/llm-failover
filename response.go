@@ -225,7 +225,9 @@ func (p *Proxy) streamSSEWithTransform(w http.ResponseWriter, body io.Reader, ct
 		block = append(block, line)
 	}
 	if len(block) > 0 {
-		flushBlock(block)
+		if ctx != nil && ctx.Request != nil {
+			p.logger().WarnCtx(ctx.Request.Context(), "drop incomplete sse block at eof", "lines", len(block))
+		}
 	}
 	if err := scanner.Err(); err != nil && ctx != nil && ctx.Request != nil {
 		p.logger().WarnCtx(ctx.Request.Context(), "sse transform scan failed", "error", err)
