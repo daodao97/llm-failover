@@ -23,7 +23,9 @@ type Config struct {
 	Observer       Observer                          // 可选可观测接口，默认 no-op
 	ErrorBody      func(errType, message string) any // 自定义错误响应体结构，返回的对象会被 JSON 编码
 	CircuitBreaker CircuitBreakerConfig
-	BreakerScope   string
+	// CircuitBreakerStore 配置熔断状态存储。为空时使用当前 Proxy 内存存储。
+	CircuitBreakerStore CircuitBreakerStore
+	BreakerScope        string
 	// CircuitBreakerWhitelist 配置不参与熔断的渠道。
 	// 支持 channel key（如 id:1、name:primary、url:https://...），也兼容裸 ID 和渠道名。
 	CircuitBreakerWhitelist []string

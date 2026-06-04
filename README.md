@@ -463,6 +463,31 @@
 
 这是“如何避免坏渠道持续拖累系统”的核心。
 
+默认情况下，熔断状态保存在当前 `Proxy` 的进程内存里。如果需要多实例共享熔断状态，可以配置 Redis store：
+
+```go
+redisClient := redis.NewClient(&redis.Options{
+	Addr: "127.0.0.1:6379",
+})
+
+p := failover.New(failover.Config{
+	CircuitBreaker: failover.CircuitBreakerConfig{
+		Enabled:            true,
+		MinSamples:         3,
+		ErrorRateThreshold: 1,
+		FailureWindow:      30 * time.Second,
+		Cooldown:           15 * time.Second,
+	},
+	CircuitBreakerStore: failover.NewRedisCircuitBreakerStore(
+		redisClient,
+		failover.RedisCircuitBreakerStoreOptions{
+			Prefix: "my-service:llm-failover:circuit",
+		},
+	),
+	BreakerScope: "messages",
+})
+```
+
 
 ** 🚀 应用方式 **
 

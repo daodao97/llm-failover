@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -88,13 +89,32 @@ type channelCircuitState struct {
 	consecutiveOpenCnt int
 }
 
+type channelCircuitStoreEntry struct {
+	key   string
+	state channelCircuitState
+}
+
+// CircuitBreakerStore 是熔断状态存储接口。
+//
+// 当前包内提供默认内存实现和 Redis 实现；外部接入通常通过 NewRedisCircuitBreakerStore 配置 Redis。
+type CircuitBreakerStore interface {
+	update(scope string, channelKey string, initial channelCircuitState, fn func(*channelCircuitState) (deleteState bool, ttl time.Duration)) error
+	snapshot(scope string) ([]channelCircuitStoreEntry, error)
+	reset(scope string) (int, error)
+	resetChannelByKey(scope string, channelKey string) (bool, error)
+}
+
+type memoryChannelCircuitStore struct {
+	mu     sync.Mutex
+	states map[string]*channelCircuitState
+}
+
 // channelCircuitBreaker 维护渠道短时间失败状态，避免持续串行试错。
 type channelCircuitBreaker struct {
-	mu     sync.Mutex
-	now    func() time.Time
-	scope  string
-	cfg    CircuitBreakerConfig
-	states map[string]*channelCircuitState
+	now   func() time.Time
+	scope string
+	cfg   CircuitBreakerConfig
+	store CircuitBreakerStore
 }
 
 type channelEventSummary struct {
@@ -134,19 +154,104 @@ type channelBreakerRegistry struct {
 
 var globalChannelBreakerRegistry = &channelBreakerRegistry{}
 
-func newChannelCircuitBreaker(scope string, cfg CircuitBreakerConfig) *channelCircuitBreaker {
+func newChannelCircuitBreaker(scope string, cfg CircuitBreakerConfig, stores ...CircuitBreakerStore) *channelCircuitBreaker {
 	cfg = normalizeCircuitBreakerConfig(cfg)
 	if !cfg.Enabled {
 		return nil
 	}
+	store := CircuitBreakerStore(newMemoryChannelCircuitStore())
+	if len(stores) > 0 && stores[0] != nil {
+		store = stores[0]
+	}
 	breaker := &channelCircuitBreaker{
-		now:    time.Now,
-		scope:  scope,
-		cfg:    cfg,
-		states: make(map[string]*channelCircuitState),
+		now:   time.Now,
+		scope: scope,
+		cfg:   cfg,
+		store: store,
 	}
 	globalChannelBreakerRegistry.register(breaker)
 	return breaker
+}
+
+func newMemoryChannelCircuitStore() *memoryChannelCircuitStore {
+	return &memoryChannelCircuitStore{
+		states: make(map[string]*channelCircuitState),
+	}
+}
+
+func (s *memoryChannelCircuitStore) update(scope string, channelKey string, initial channelCircuitState, fn func(*channelCircuitState) (bool, time.Duration)) error {
+	if s == nil || channelKey == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	storeKey := channelCircuitStoreKey(scope, channelKey)
+	state, ok := s.states[storeKey]
+	if !ok {
+		state = cloneChannelCircuitState(&initial)
+		s.states[storeKey] = state
+	}
+
+	deleteState, _ := fn(state)
+	if deleteState {
+		delete(s.states, storeKey)
+	}
+	return nil
+}
+
+func (s *memoryChannelCircuitStore) snapshot(scope string) ([]channelCircuitStoreEntry, error) {
+	if s == nil {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries := make([]channelCircuitStoreEntry, 0, len(s.states))
+	prefix := channelCircuitStoreScopePrefix(scope)
+	for storeKey, state := range s.states {
+		if !strings.HasPrefix(storeKey, prefix) {
+			continue
+		}
+		entries = append(entries, channelCircuitStoreEntry{
+			key:   strings.TrimPrefix(storeKey, prefix),
+			state: *cloneChannelCircuitState(state),
+		})
+	}
+	return entries, nil
+}
+
+func (s *memoryChannelCircuitStore) reset(scope string) (int, error) {
+	if s == nil {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prefix := channelCircuitStoreScopePrefix(scope)
+	count := 0
+	for key := range s.states {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.states, key)
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *memoryChannelCircuitStore) resetChannelByKey(scope string, channelKey string) (bool, error) {
+	if s == nil || channelKey == "" {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	storeKey := channelCircuitStoreKey(scope, channelKey)
+	if _, ok := s.states[storeKey]; !ok {
+		return false, nil
+	}
+	delete(s.states, storeKey)
+	return true, nil
 }
 
 func normalizeCircuitBreakerConfig(cfg CircuitBreakerConfig) CircuitBreakerConfig {
@@ -172,167 +277,171 @@ func normalizeCircuitBreakerConfig(cfg CircuitBreakerConfig) CircuitBreakerConfi
 }
 
 func (b *channelCircuitBreaker) Allow(ch *Channel) (bool, time.Duration, bool) {
-	if b == nil || ch == nil {
+	if b == nil || b.store == nil || ch == nil {
 		return true, 0, false
 	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	now := b.now()
-	state := b.stateForLocked(ch)
-	state.events = trimEvents(state.events, now, b.cfg.FailureWindow)
-	state.updatedAt = now
-	if len(state.events) == 0 && !state.openUntil.After(now) && !state.halfOpen {
-		delete(b.states, channelCircuitKey(ch))
+	allowed := true
+	wait := time.Duration(0)
+	probe := false
+	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+		updateChannelCircuitStateMetadata(state, ch)
+		state.events = trimEvents(state.events, now, b.cfg.FailureWindow)
+		state.updatedAt = now
+		if len(state.events) == 0 && !state.openUntil.After(now) && !state.halfOpen {
+			return true, 0
+		}
+
+		if state.openUntil.After(now) {
+			allowed = false
+			wait = state.openUntil.Sub(now)
+			return false, b.stateTTL(state, now)
+		}
+
+		if !state.openUntil.IsZero() {
+			if state.halfOpen {
+				allowed = false
+				probe = true
+				return false, b.stateTTL(state, now)
+			}
+			state.halfOpen = true
+			probe = true
+			return false, b.stateTTL(state, now)
+		}
+
+		return false, b.stateTTL(state, now)
+	})
+	if err != nil {
 		return true, 0, false
 	}
-
-	if state.openUntil.After(now) {
-		return false, time.Until(state.openUntil), false
-	}
-
-	if !state.openUntil.IsZero() {
-		if state.halfOpen {
-			return false, 0, true
-		}
-		state.halfOpen = true
-		return true, 0, true
-	}
-
-	return true, 0, false
+	return allowed, wait, probe
 }
 
 func (b *channelCircuitBreaker) RecordSuccess(ch *Channel, latency time.Duration, stream bool) (opened bool, wait time.Duration, reason string) {
-	if b == nil || ch == nil {
+	if b == nil || b.store == nil || ch == nil {
 		return false, 0, ""
 	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	now := b.now()
-	state := b.stateForLocked(ch)
-	event := channelCircuitEvent{
-		at:      now,
-		success: true,
-		latency: latency,
-		slow:    isSlowEvent(latency, stream, b.cfg),
-		stream:  stream,
-	}
-	state.events = append(trimEvents(state.events, now, b.cfg.FailureWindow), event)
-	state.updatedAt = now
-	state.lastLatency = latency
+	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+		updateChannelCircuitStateMetadata(state, ch)
+		event := channelCircuitEvent{
+			at:      now,
+			success: true,
+			latency: latency,
+			slow:    isSlowEvent(latency, stream, b.cfg),
+			stream:  stream,
+		}
+		state.events = append(trimEvents(state.events, now, b.cfg.FailureWindow), event)
+		state.updatedAt = now
+		state.lastLatency = latency
 
-	if state.halfOpen {
-		state.events = nil
+		if state.halfOpen {
+			state.events = nil
+			state.halfOpen = false
+			state.openUntil = time.Time{}
+			state.openReason = ""
+			state.currentCooldown = 0
+			state.consecutiveOpenCnt = 0
+			return true, 0
+		}
+		if state.openUntil.After(now) {
+			state.openUntil = time.Time{}
+		}
+
+		summary := summarizeEvents(state.events)
+		if summary.RequestCount == 0 {
+			return false, b.stateTTL(state, now)
+		}
+		errorRate := float64(summary.FailureCount) / float64(summary.RequestCount)
+		slowRate := float64(summary.SlowCount) / float64(summary.RequestCount)
+		shouldOpen, openReason := b.shouldOpen(state, summary.RequestCount, errorRate, slowRate)
+		if !shouldOpen {
+			return false, b.stateTTL(state, now)
+		}
+
 		state.halfOpen = false
-		state.openUntil = time.Time{}
-		state.openReason = ""
-		state.currentCooldown = 0
-		state.consecutiveOpenCnt = 0
+		wait = b.nextCooldownLocked(state)
+		state.openUntil = now.Add(wait)
+		state.openReason = openReason
+		opened = true
+		reason = openReason
+		return false, b.stateTTL(state, now)
+	})
+	if err != nil {
 		return false, 0, ""
 	}
-	if state.openUntil.After(now) {
-		state.openUntil = time.Time{}
-	}
-
-	summary := summarizeEvents(state.events)
-	if summary.RequestCount == 0 {
-		return false, 0, ""
-	}
-	errorRate := float64(summary.FailureCount) / float64(summary.RequestCount)
-	slowRate := float64(summary.SlowCount) / float64(summary.RequestCount)
-	shouldOpen, openReason := b.shouldOpen(state, summary.RequestCount, errorRate, slowRate)
-	if !shouldOpen {
-		return false, 0, ""
-	}
-
-	state.halfOpen = false
-	wait = b.nextCooldownLocked(state)
-	state.openUntil = now.Add(wait)
-	state.openReason = openReason
-	return true, wait, openReason
+	return opened, wait, reason
 }
 
 func (b *channelCircuitBreaker) RecordFailure(ch *Channel, latency time.Duration, stream bool, statusCode int) (opened bool, reopen bool, wait time.Duration, reason string) {
-	if b == nil || ch == nil {
+	if b == nil || b.store == nil || ch == nil {
 		return false, false, 0, ""
 	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	now := b.now()
-	state := b.stateForLocked(ch)
-	event := channelCircuitEvent{
-		at:      now,
-		success: false,
-		latency: latency,
-		slow:    isSlowEvent(latency, stream, b.cfg),
-		stream:  stream,
-	}
-	state.events = append(trimEvents(state.events, now, b.cfg.FailureWindow), event)
-	state.updatedAt = now
-	state.lastLatency = latency
-	state.lastFailureStatus = statusCode
+	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+		updateChannelCircuitStateMetadata(state, ch)
+		event := channelCircuitEvent{
+			at:      now,
+			success: false,
+			latency: latency,
+			slow:    isSlowEvent(latency, stream, b.cfg),
+			stream:  stream,
+		}
+		state.events = append(trimEvents(state.events, now, b.cfg.FailureWindow), event)
+		state.updatedAt = now
+		state.lastLatency = latency
+		state.lastFailureStatus = statusCode
 
-	summary := summarizeEvents(state.events)
-	errorRate := 0.0
-	if summary.RequestCount > 0 {
-		errorRate = float64(summary.FailureCount) / float64(summary.RequestCount)
-	}
-	slowRate := 0.0
-	if summary.RequestCount > 0 {
-		slowRate = float64(summary.SlowCount) / float64(summary.RequestCount)
-	}
+		summary := summarizeEvents(state.events)
+		errorRate := 0.0
+		if summary.RequestCount > 0 {
+			errorRate = float64(summary.FailureCount) / float64(summary.RequestCount)
+		}
+		slowRate := 0.0
+		if summary.RequestCount > 0 {
+			slowRate = float64(summary.SlowCount) / float64(summary.RequestCount)
+		}
 
-	shouldOpen, openReason := b.shouldOpen(state, summary.RequestCount, errorRate, slowRate)
-	if !shouldOpen {
+		shouldOpen, openReason := b.shouldOpen(state, summary.RequestCount, errorRate, slowRate)
+		if !shouldOpen {
+			return false, b.stateTTL(state, now)
+		}
+
+		reopen = state.halfOpen
+		state.halfOpen = false
+		wait = b.nextCooldownLocked(state)
+		state.openUntil = now.Add(wait)
+		state.openReason = openReason
+		opened = true
+		reason = openReason
+		return false, b.stateTTL(state, now)
+	})
+	if err != nil {
 		return false, false, 0, ""
 	}
-
-	reopen = state.halfOpen
-	state.halfOpen = false
-	wait = b.nextCooldownLocked(state)
-	state.openUntil = now.Add(wait)
-	state.openReason = openReason
-	return true, reopen, wait, openReason
-}
-
-func (b *channelCircuitBreaker) stateForLocked(ch *Channel) *channelCircuitState {
-	key := channelCircuitKey(ch)
-	if state, ok := b.states[key]; ok {
-		if ch.Id > 0 {
-			state.channelID = ch.Id
-		}
-		if ch.Name != "" {
-			state.name = ch.Name
-		}
-		return state
-	}
-	state := &channelCircuitState{
-		channelID: ch.Id,
-		name:      ch.Name,
-	}
-	b.states[key] = state
-	return state
+	return opened, reopen, wait, reason
 }
 
 func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
-	if b == nil {
+	if b == nil || b.store == nil {
 		return nil
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	now := b.now()
-	snapshots := make([]ChannelHealthSnapshot, 0, len(b.states))
-	for key, state := range b.states {
+	entries, err := b.store.snapshot(b.scope)
+	if err != nil {
+		return nil
+	}
+	snapshots := make([]ChannelHealthSnapshot, 0, len(entries))
+	for _, entry := range entries {
+		key := entry.key
+		state := entry.state
 		state.events = trimEvents(state.events, now, b.cfg.FailureWindow)
 		if len(state.events) == 0 && !state.openUntil.After(now) && !state.halfOpen {
-			delete(b.states, key)
+			_, _ = b.store.resetChannelByKey(b.scope, key)
 			continue
 		}
 		summary := summarizeEvents(state.events)
@@ -434,15 +543,14 @@ func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
 }
 
 func (b *channelCircuitBreaker) Reset() int {
-	if b == nil {
+	if b == nil || b.store == nil {
 		return 0
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	count := len(b.states)
-	b.states = make(map[string]*channelCircuitState)
+	count, err := b.store.reset(b.scope)
+	if err != nil {
+		return 0
+	}
 	return count
 }
 
@@ -454,18 +562,15 @@ func (b *channelCircuitBreaker) ResetChannel(ch *Channel) bool {
 }
 
 func (b *channelCircuitBreaker) ResetChannelByKey(channelKey string) bool {
-	if b == nil || channelKey == "" {
+	if b == nil || b.store == nil || channelKey == "" {
 		return false
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if _, ok := b.states[channelKey]; !ok {
+	ok, err := b.store.resetChannelByKey(b.scope, channelKey)
+	if err != nil {
 		return false
 	}
-	delete(b.states, channelKey)
-	return true
+	return ok
 }
 
 func (r *channelBreakerRegistry) register(b *channelCircuitBreaker) {
@@ -481,12 +586,12 @@ func ListChannelHealthSnapshots() []ChannelHealthSnapshot {
 	return globalChannelBreakerRegistry.snapshot()
 }
 
-// ResetChannelHealthStats 清空当前进程内所有熔断器的渠道统计和状态。
+// ResetChannelHealthStats 清空当前进程已注册熔断器对应存储中的渠道统计和状态。
 func ResetChannelHealthStats() int {
 	return globalChannelBreakerRegistry.reset()
 }
 
-// ResetChannelHealthStatsForChannel 按渠道清空当前进程内所有熔断器的统计和状态。
+// ResetChannelHealthStatsForChannel 按渠道清空当前进程已注册熔断器对应存储中的统计和状态。
 func ResetChannelHealthStatsForChannel(ch *Channel) int {
 	if ch == nil {
 		return 0
@@ -494,7 +599,7 @@ func ResetChannelHealthStatsForChannel(ch *Channel) int {
 	return globalChannelBreakerRegistry.resetChannelByKey(channelCircuitKey(ch))
 }
 
-// ResetChannelHealthStatsByKey 按渠道 key 清空当前进程内所有熔断器的统计和状态。
+// ResetChannelHealthStatsByKey 按渠道 key 清空当前进程已注册熔断器对应存储中的统计和状态。
 func ResetChannelHealthStatsByKey(channelKey string) int {
 	return globalChannelBreakerRegistry.resetChannelByKey(channelKey)
 }
@@ -565,6 +670,63 @@ func channelCircuitKey(ch *Channel) string {
 		return "name:" + ch.Name
 	}
 	return "url:" + ch.BaseURL
+}
+
+func channelCircuitStoreScopePrefix(scope string) string {
+	return scope + "\x00"
+}
+
+func channelCircuitStoreKey(scope string, channelKey string) string {
+	return channelCircuitStoreScopePrefix(scope) + channelKey
+}
+
+func newChannelCircuitState(ch *Channel) channelCircuitState {
+	state := channelCircuitState{}
+	updateChannelCircuitStateMetadata(&state, ch)
+	return state
+}
+
+func updateChannelCircuitStateMetadata(state *channelCircuitState, ch *Channel) {
+	if state == nil || ch == nil {
+		return
+	}
+	if ch.Id > 0 {
+		state.channelID = ch.Id
+	}
+	if ch.Name != "" {
+		state.name = ch.Name
+	}
+}
+
+func cloneChannelCircuitState(state *channelCircuitState) *channelCircuitState {
+	if state == nil {
+		return &channelCircuitState{}
+	}
+	cloned := *state
+	if state.events != nil {
+		cloned.events = append([]channelCircuitEvent(nil), state.events...)
+	}
+	return &cloned
+}
+
+func (b *channelCircuitBreaker) stateTTL(state *channelCircuitState, now time.Time) time.Duration {
+	if b == nil {
+		return time.Minute
+	}
+
+	ttl := b.cfg.FailureWindow + b.cfg.Cooldown + time.Minute
+	if state != nil {
+		if state.openUntil.After(now) {
+			ttl = state.openUntil.Sub(now) + b.cfg.FailureWindow + time.Minute
+		}
+		if state.currentCooldown > b.cfg.Cooldown {
+			ttl += state.currentCooldown - b.cfg.Cooldown
+		}
+	}
+	if ttl <= 0 {
+		return time.Minute
+	}
+	return ttl
 }
 
 func trimEvents(events []channelCircuitEvent, now time.Time, window time.Duration) []channelCircuitEvent {

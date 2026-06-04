@@ -44,7 +44,7 @@ func New(cfg Config) *Proxy {
 	cfg.CircuitBreaker = normalizeCircuitBreakerConfig(cfg.CircuitBreaker)
 	return &Proxy{
 		cfg:     cfg,
-		breaker: newChannelCircuitBreaker(cfg.BreakerScope, cfg.CircuitBreaker),
+		breaker: newChannelCircuitBreaker(cfg.BreakerScope, cfg.CircuitBreaker, cfg.CircuitBreakerStore),
 	}
 }
 

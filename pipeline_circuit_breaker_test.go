@@ -1507,3 +1507,43 @@ func TestResetChannelHealthStatsByKeyAcrossBreakers(t *testing.T) {
 		t.Fatalf("p2 shared channel should be closed after global reset")
 	}
 }
+
+func TestCircuitBreakerStoreSharesStateAcrossProxies(t *testing.T) {
+	store := newMemoryChannelCircuitStore()
+	cfg := Config{
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         1,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Minute,
+			Cooldown:           time.Minute,
+		},
+		CircuitBreakerStore: store,
+		BreakerScope:        "messages",
+	}
+	p1 := New(cfg)
+	p2 := New(cfg)
+
+	ch := &Channel{Id: 100, Name: "shared-store", BaseURL: "https://shared-store.example.com"}
+	if opened, _, _, _ := p1.breaker.RecordFailure(ch, 0, false, http.StatusBadGateway); !opened {
+		t.Fatalf("p1 failure should open circuit")
+	}
+	if allowed, _, _ := p2.breaker.Allow(ch); allowed {
+		t.Fatalf("p2 should see circuit opened by p1")
+	}
+
+	p3 := New(Config{
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         1,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Minute,
+			Cooldown:           time.Minute,
+		},
+		CircuitBreakerStore: store,
+		BreakerScope:        "embeddings",
+	})
+	if allowed, _, _ := p3.breaker.Allow(ch); !allowed {
+		t.Fatalf("different breaker scope should not share circuit state")
+	}
+}
