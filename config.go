@@ -25,7 +25,14 @@ type Config struct {
 	CircuitBreaker CircuitBreakerConfig
 	// CircuitBreakerStore 配置熔断状态存储。为空时使用当前 Proxy 内存存储。
 	CircuitBreakerStore CircuitBreakerStore
-	BreakerScope        string
+	// FailoverTimeout 限制整条 failover 尝试链路的最长耗时。为空时不限制。
+	// 该预算只约束选路、重试和拿到上游响应头之前的阶段，不会在成功响应后主动中断响应体转发。
+	FailoverTimeout time.Duration
+	// AttemptTimeout 限制单次上游 attempt 在拿到响应头前的最长耗时。为空时不限制。
+	AttemptTimeout time.Duration
+	// MinAttemptTimeout 表示发起下一次 attempt 至少需要保留的剩余总预算。为空时只要求总预算未耗尽。
+	MinAttemptTimeout time.Duration
+	BreakerScope      string
 	// CircuitBreakerWhitelist 配置不参与熔断的渠道。
 	// 支持 channel key（如 id:1、name:primary、url:https://...），也兼容裸 ID 和渠道名。
 	CircuitBreakerWhitelist []string
@@ -79,6 +86,8 @@ type Context struct {
 	LastResponseHeader http.Header
 	LastResponseBody   []byte
 	PoolStats          PoolStats
+	FailoverDeadline   time.Time
+	AttemptDeadline    time.Time
 }
 
 func (c *Context) resetForChannel() {

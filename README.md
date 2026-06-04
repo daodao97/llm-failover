@@ -488,6 +488,29 @@ p := failover.New(failover.Config{
 })
 ```
 
+如果服务挂在 Cloudflare 后面，建议同时配置 failover 时间预算，避免顺序渠道重试把请求拖到 Cloudflare 超时：
+
+```go
+p := failover.New(failover.Config{
+	FailoverTimeout:   85 * time.Second,
+	AttemptTimeout:    20 * time.Second,
+	MinAttemptTimeout: 5 * time.Second,
+	Retry: failover.RetryConfig{
+		MaxAttempts: 1,
+	},
+	CircuitBreaker: failover.CircuitBreakerConfig{
+		Enabled:           true,
+		SlowThreshold:     20 * time.Second,
+		SlowRateThreshold: 0.5,
+	},
+})
+```
+
+- `FailoverTimeout` 是整条选路、重试、降级链路的总预算。
+- `AttemptTimeout` 是单次上游 attempt 在拿到响应头前的预算。
+- `MinAttemptTimeout` 用来避免剩余时间太少时继续发起下一次 attempt。
+- 成功拿到上游响应后，预算计时不会主动中断响应体转发，避免误伤 SSE/流式响应。
+
 
 ** 🚀 应用方式 **
 

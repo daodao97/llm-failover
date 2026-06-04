@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestServeHTTPPostRetriesWhenRetryConfigured(t *testing.T) {
@@ -47,6 +48,58 @@ func TestServeHTTPPostRetriesWhenRetryConfigured(t *testing.T) {
 	}
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("status=%d, want=%d", w.Code, http.StatusTooManyRequests)
+	}
+}
+
+func TestServeHTTPImmediateRetryWithFailoverTimeout(t *testing.T) {
+	attempts := 0
+	ch := Channel{
+		Id:      203,
+		Name:    "immediate-retry-post",
+		Enabled: true,
+		GetKeys: func(ctx *Context) []Key {
+			return []Key{{ID: "k1", Value: "v1"}}
+		},
+		Handler: func(ctx *Context) (*http.Response, error) {
+			attempts++
+			status := http.StatusTooManyRequests
+			if attempts == 2 {
+				status = http.StatusOK
+			}
+			return &http.Response{
+				StatusCode: status,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			}, nil
+		},
+	}
+
+	p := New(Config{
+		Channels:        []Channel{ch},
+		FailoverTimeout: time.Second,
+		Retry: RetryConfig{
+			MaxAttempts: 2,
+			BaseDelay:   0,
+			RetryOnResponse: func(ctx *Context, ch *Channel, code int, body []byte) bool {
+				return code == http.StatusTooManyRequests
+			},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	w := httptest.NewRecorder()
+	start := time.Now()
+	p.ServeHTTP(w, req)
+	elapsed := time.Since(start)
+
+	if attempts != 2 {
+		t.Fatalf("attempts=%d, want=2", attempts)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want=%d", w.Code, http.StatusOK)
+	}
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("zero backoff should retry immediately, elapsed=%s", elapsed)
 	}
 }
 

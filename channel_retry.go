@@ -2,6 +2,7 @@ package failover
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"github.com/tidwall/gjson"
@@ -47,6 +48,11 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 
 		// 每个 Key 的重试循环
 		for attempt := 1; attempt <= cfg.MaxAttempts; attempt++ {
+			if err := p.failoverBudgetError(ctx); err != nil {
+				lastErr = err
+				return nil, err
+			}
+
 			ctx.resetForAttempt(keyHeader)
 			ctx.Attempt = attempt
 			currentKey := &keys[keyIdx]
@@ -65,12 +71,27 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 				return nil, err
 			}
 
+			attemptReq, cleanupAttempt, err := p.requestForAttempt(r, ctx)
+			if err != nil {
+				lastErr = err
+				emitAttemptError(err)
+				emitAttemptDone(nil, err, AttemptResultFailed)
+				return nil, err
+			}
+
 			// 调用 BeforeAttempt 钩子（每次尝试前调用，用于日志记录、指标采集）
 			if p.cfg.BeforeAttempt != nil {
 				p.cfg.BeforeAttempt(ctx)
 			}
 
-			resp, err := p.executeSingleAttempt(r, ctx, ch, &keys[keyIdx])
+			resp, err := p.executeSingleAttempt(attemptReq, ctx, ch, &keys[keyIdx])
+			if cleanupAttempt != nil && cleanupAttempt(resp, err) {
+				if err != nil {
+					err = fmt.Errorf("attempt timeout exceeded: %w: %v", context.DeadlineExceeded, err)
+				} else {
+					err = fmt.Errorf("attempt timeout exceeded: %w", context.DeadlineExceeded)
+				}
+			}
 			if err == nil && resp == nil {
 				err = errEmptyResponseTryChannelLoop
 			}
@@ -120,7 +141,7 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 					p.observer().OnRetry(ctx, ch, currentKey, retryReason)
 					emitAttemptError(lastErr)
 					emitAttemptDone(resp, lastErr, AttemptResultFailed)
-					sleep(r.Context(), backoff(cfg, attempt))
+					sleepWithFailoverBudget(r.Context(), backoff(cfg, attempt), ctx.FailoverDeadline)
 					continue
 				}
 				emitAttemptError(lastErr)
@@ -369,7 +390,7 @@ func (p *Proxy) shouldRetryOnExecutionError(r *http.Request, ctx *Context, ch *C
 	ctx.RetryReason = fmt.Sprintf("error: %v", err)
 	p.observer().OnRetry(ctx, ch, ctx.CurrentKey, ctx.RetryReason)
 	emitAttemptError(err)
-	sleep(r.Context(), backoff(cfg, attempt))
+	sleepWithFailoverBudget(r.Context(), backoff(cfg, attempt), ctx.FailoverDeadline)
 	return true
 }
 

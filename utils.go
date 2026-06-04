@@ -234,9 +234,6 @@ func IsPoolExhaustedError(err error) bool {
 }
 
 func finalErrorStatusCode(ctx *Context, err error) int {
-	if ctx != nil && ctx.LastStatusCode >= http.StatusBadRequest {
-		return ctx.LastStatusCode
-	}
 	if IsContextDeadlineExceededError(err) {
 		return http.StatusGatewayTimeout
 	}
@@ -245,6 +242,9 @@ func finalErrorStatusCode(ctx *Context, err error) int {
 	}
 	if te, ok := err.(interface{ Timeout() bool }); ok && te.Timeout() {
 		return http.StatusGatewayTimeout
+	}
+	if ctx != nil && ctx.LastStatusCode >= http.StatusBadRequest {
+		return ctx.LastStatusCode
 	}
 	return http.StatusBadGateway
 }

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSelectChannelsReturns503WhenNoChannelsAvailable(t *testing.T) {
@@ -117,5 +118,40 @@ func TestServeHTTPGetChannelsCanReadRequestBody(t *testing.T) {
 	}
 	if body := w.Body.String(); !strings.Contains(body, `"channel":"route-b"`) {
 		t.Fatalf("body=%s", body)
+	}
+}
+
+func TestServeHTTPGetChannelsReceivesFailoverDeadline(t *testing.T) {
+	deadlineSeen := false
+	p := New(Config{
+		FailoverTimeout: 30 * time.Millisecond,
+		GetChannels: func(r *http.Request) ([]Channel, error) {
+			deadline, ok := r.Context().Deadline()
+			if !ok {
+				return nil, errors.New("missing request deadline")
+			}
+			if remaining := time.Until(deadline); remaining <= 0 || remaining > time.Second {
+				return nil, errors.New("unexpected request deadline")
+			}
+			deadlineSeen = true
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	w := httptest.NewRecorder()
+	start := time.Now()
+	p.ServeHTTP(w, req)
+	elapsed := time.Since(start)
+
+	if !deadlineSeen {
+		t.Fatalf("GetChannels should receive request context with failover deadline")
+	}
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status=%d, want=%d body=%s", w.Code, http.StatusGatewayTimeout, w.Body.String())
+	}
+	if elapsed >= 150*time.Millisecond {
+		t.Fatalf("GetChannels should be canceled by failover timeout, elapsed=%s", elapsed)
 	}
 }

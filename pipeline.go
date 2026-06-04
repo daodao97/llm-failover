@@ -57,6 +57,12 @@ func classifySelectChannelsStatus(err error) int {
 	if err == nil {
 		return http.StatusBadRequest
 	}
+	if IsContextDeadlineExceededError(err) {
+		return http.StatusGatewayTimeout
+	}
+	if IsContextCanceledError(err) {
+		return 499
+	}
 
 	msg := strings.ToLower(strings.TrimSpace(err.Error()))
 	switch msg {
@@ -70,7 +76,13 @@ func classifySelectChannelsStatus(err error) int {
 // tryChannels 阶段二：按顺序尝试每个渠道
 func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, retryCfg RetryConfig) pipelineResult {
 	result := pipelineResult{}
+	p.initFailoverDeadline(ctx)
 	for i := range channels {
+		if err := p.failoverBudgetError(ctx); err != nil {
+			result.lastErr = err
+			return result
+		}
+
 		probeMode := false
 		if p.breaker != nil && !p.isCircuitBreakerWhitelisted(&channels[i]) {
 			if allowed, wait, probe := p.breaker.Allow(&channels[i]); !allowed {

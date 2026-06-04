@@ -87,6 +87,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := &Context{
 		Request: r,
 	}
+	p.initFailoverDeadline(ctx)
+	r, cancelFailover := failoverRequestWithDeadline(r, ctx)
+	defer cancelFailover()
 	obs := p.observer()
 	var doneErr error
 	obs.OnRequestStart(ctx)
