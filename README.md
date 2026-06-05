@@ -450,6 +450,11 @@
 - `MaxAttempts` 越大，单个用户请求愿意在同一渠道上消耗的时间越多
 - 如果你的上游常见问题是 `429` 或短时间限流，通常更适合把 `MaxAttempts` 设小一些，让渠道级 failover 和熔断更早接管
 
+需要注意渠道级切换的默认行为：
+
+- 如果你配置了 `RetryOnResponse`，是否切换下一个渠道完全由它决定
+- 如果没有配置 `RetryOnResponse`（例如只设置了 `MaxAttempts`），上游返回 `429` 或 `5xx` 时默认会继续尝试下一个渠道，其他 `4xx` 不会切换
+
 
 ### `CircuitBreakerConfig`
 

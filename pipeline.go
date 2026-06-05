@@ -262,7 +262,12 @@ func (p *Proxy) shouldContinueToNextChannel(ctx *Context, ch *Channel, cfg Retry
 		return true
 	}
 	if ctx != nil && ctx.LastStatusCode >= http.StatusBadRequest {
-		return cfg.RetryOnResponse != nil && cfg.RetryOnResponse(ctx, ch, ctx.LastStatusCode, ctx.LastResponseBody)
+		if cfg.RetryOnResponse != nil {
+			return cfg.RetryOnResponse(ctx, ch, ctx.LastStatusCode, ctx.LastResponseBody)
+		}
+		// RetryOnResponse 未配置时的安全默认：429 和 5xx 应继续尝试下一个渠道，
+		// 避免单渠道的临时限流或服务端错误直接导致整个请求失败。
+		return ctx.LastStatusCode == http.StatusTooManyRequests || ctx.LastStatusCode >= http.StatusInternalServerError
 	}
 	if cfg.RetryOnError != nil {
 		return cfg.RetryOnError(ctx, ch, err)
