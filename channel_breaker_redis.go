@@ -50,6 +50,7 @@ type redisChannelCircuitState struct {
 	Events                    []redisChannelCircuitEvent `json:"events"`
 	OpenUntil                 time.Time                  `json:"open_until,omitempty"`
 	HalfOpen                  bool                       `json:"half_open,omitempty"`
+	ProbeDeadline             time.Time                  `json:"probe_deadline,omitempty"`
 	UpdatedAt                 time.Time                  `json:"updated_at,omitempty"`
 	ChannelID                 int                        `json:"channel_id,omitempty"`
 	Name                      string                     `json:"name,omitempty"`
@@ -265,6 +266,7 @@ func encodeRedisChannelCircuitState(state *channelCircuitState) ([]byte, error) 
 	redisState := redisChannelCircuitState{
 		OpenUntil:                 state.openUntil,
 		HalfOpen:                  state.halfOpen,
+		ProbeDeadline:             state.probeDeadline,
 		UpdatedAt:                 state.updatedAt,
 		ChannelID:                 state.channelID,
 		Name:                      state.name,
@@ -299,6 +301,7 @@ func decodeRedisChannelCircuitState(raw []byte) (*channelCircuitState, error) {
 	state := &channelCircuitState{
 		openUntil:                 redisState.OpenUntil,
 		halfOpen:                  redisState.HalfOpen,
+		probeDeadline:             redisState.ProbeDeadline,
 		updatedAt:                 redisState.UpdatedAt,
 		channelID:                 redisState.ChannelID,
 		name:                      redisState.Name,

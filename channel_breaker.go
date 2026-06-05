@@ -14,6 +14,7 @@ const (
 	defaultChannelCircuitErrorRateThreshold = 1.0
 	defaultChannelCircuitFailureWindow      = 30 * time.Second
 	defaultChannelCircuitCooldown           = 15 * time.Second
+	defaultChannelCircuitProbeTimeout       = time.Minute
 )
 
 type ChannelHealthSnapshot struct {
@@ -80,6 +81,7 @@ type channelCircuitState struct {
 	events                    []channelCircuitEvent
 	openUntil                 time.Time
 	halfOpen                  bool
+	probeDeadline             time.Time
 	updatedAt                 time.Time
 	channelID                 int
 	name                      string
@@ -108,7 +110,19 @@ type CircuitBreakerStore interface {
 
 type memoryChannelCircuitStore struct {
 	mu     sync.Mutex
-	states map[string]*channelCircuitState
+	states map[string]*memoryChannelCircuitEntry
+}
+
+// memoryChannelCircuitEntry 是内存 store 的状态条目，支持按 TTL 惰性过期。
+// 注意：白名单渠道的统计条目同样会过期——空闲超过 TTL 后会从健康快照中消失，
+// 这是有意为之，与 Redis store 的 TTL 行为保持一致。
+type memoryChannelCircuitEntry struct {
+	state    *channelCircuitState
+	expireAt time.Time
+}
+
+func (e *memoryChannelCircuitEntry) expired(now time.Time) bool {
+	return e != nil && !e.expireAt.IsZero() && now.After(e.expireAt)
 }
 
 // channelCircuitBreaker 维护渠道短时间失败状态，避免持续串行试错。
@@ -177,7 +191,7 @@ func newChannelCircuitBreaker(scope string, cfg CircuitBreakerConfig, stores ...
 
 func newMemoryChannelCircuitStore() *memoryChannelCircuitStore {
 	return &memoryChannelCircuitStore{
-		states: make(map[string]*channelCircuitState),
+		states: make(map[string]*memoryChannelCircuitEntry),
 	}
 }
 
@@ -188,16 +202,25 @@ func (s *memoryChannelCircuitStore) update(scope string, channelKey string, init
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	now := time.Now()
 	storeKey := channelCircuitStoreKey(scope, channelKey)
-	state, ok := s.states[storeKey]
+	entry, ok := s.states[storeKey]
+	if ok && entry.expired(now) {
+		delete(s.states, storeKey)
+		ok = false
+	}
 	if !ok {
-		state = cloneChannelCircuitState(&initial)
-		s.states[storeKey] = state
+		entry = &memoryChannelCircuitEntry{state: cloneChannelCircuitState(&initial)}
+		s.states[storeKey] = entry
 	}
 
-	deleteState, _ := fn(state)
+	deleteState, ttl := fn(entry.state)
 	if deleteState {
 		delete(s.states, storeKey)
+		return nil
+	}
+	if ttl > 0 {
+		entry.expireAt = now.Add(ttl)
 	}
 	return nil
 }
@@ -209,15 +232,20 @@ func (s *memoryChannelCircuitStore) snapshot(scope string) ([]channelCircuitStor
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	now := time.Now()
 	entries := make([]channelCircuitStoreEntry, 0, len(s.states))
 	prefix := channelCircuitStoreScopePrefix(scope)
-	for storeKey, state := range s.states {
+	for storeKey, entry := range s.states {
 		if !strings.HasPrefix(storeKey, prefix) {
+			continue
+		}
+		if entry.expired(now) {
+			delete(s.states, storeKey)
 			continue
 		}
 		entries = append(entries, channelCircuitStoreEntry{
 			key:   strings.TrimPrefix(storeKey, prefix),
-			state: *cloneChannelCircuitState(state),
+			state: *cloneChannelCircuitState(entry.state),
 		})
 	}
 	return entries, nil
@@ -272,6 +300,9 @@ func normalizeCircuitBreakerConfig(cfg CircuitBreakerConfig) CircuitBreakerConfi
 	if cfg.Cooldown <= 0 {
 		cfg.Cooldown = defaultChannelCircuitCooldown
 	}
+	if cfg.ProbeTimeout <= 0 {
+		cfg.ProbeTimeout = defaultChannelCircuitProbeTimeout
+	}
 	if effectiveStreamSlowThreshold(cfg) > 0 && cfg.SlowRateThreshold <= 0 {
 		cfg.SlowRateThreshold = 1
 	}
@@ -302,12 +333,16 @@ func (b *channelCircuitBreaker) Allow(ch *Channel) (bool, time.Duration, bool) {
 		}
 
 		if !state.openUntil.IsZero() {
-			if state.halfOpen {
+			if state.halfOpen && now.Before(state.probeDeadline) {
+				// 已有探测在途，其他请求继续跳过该渠道
 				allowed = false
 				probe = true
 				return false, b.stateTTL(state, now)
 			}
+			// 没有在途探测，或上一个探测超过 ProbeTimeout 仍无结论（视同放弃），
+			// 授予新探测并续上 deadline，保证状态机对任何未解决的探测都能自愈。
 			state.halfOpen = true
+			state.probeDeadline = now.Add(b.cfg.ProbeTimeout)
 			probe = true
 			return false, b.stateTTL(state, now)
 		}
@@ -318,6 +353,26 @@ func (b *channelCircuitBreaker) Allow(ch *Channel) (bool, time.Duration, bool) {
 		return true, 0, false
 	}
 	return allowed, wait, probe
+}
+
+// CancelProbe 在半开探测无结论时复位 halfOpen，让后续请求可以重新发起探测。
+// "无结论"指探测失败但未计入熔断（例如 4xx 不记账、客户端取消/超时）。
+// 该调用幂等：若探测失败已通过 RecordFailure 重新打开熔断（halfOpen 已为 false），则不做任何事。
+func (b *channelCircuitBreaker) CancelProbe(ch *Channel) {
+	if b == nil || b.store == nil || ch == nil {
+		return
+	}
+
+	now := b.now()
+	_ = b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+		if !state.halfOpen {
+			return false, b.stateTTL(state, now)
+		}
+		state.halfOpen = false
+		state.probeDeadline = time.Time{}
+		state.updatedAt = now
+		return false, b.stateTTL(state, now)
+	})
 }
 
 func (b *channelCircuitBreaker) TrackChannel(ch *Channel, circuitBreakerWhitelisted bool) {
@@ -357,6 +412,7 @@ func (b *channelCircuitBreaker) RecordSuccess(ch *Channel, latency time.Duration
 		if state.halfOpen {
 			state.events = nil
 			state.halfOpen = false
+			state.probeDeadline = time.Time{}
 			state.openUntil = time.Time{}
 			state.openReason = ""
 			state.currentCooldown = 0
@@ -379,6 +435,7 @@ func (b *channelCircuitBreaker) RecordSuccess(ch *Channel, latency time.Duration
 		}
 
 		state.halfOpen = false
+		state.probeDeadline = time.Time{}
 		wait = b.nextCooldownLocked(state)
 		state.openUntil = now.Add(wait)
 		state.openReason = openReason
@@ -412,6 +469,7 @@ func (b *channelCircuitBreaker) RecordWhitelistedSuccess(ch *Channel, latency ti
 		state.lastLatency = latency
 		state.openUntil = time.Time{}
 		state.halfOpen = false
+		state.probeDeadline = time.Time{}
 		state.openReason = ""
 		state.currentCooldown = 0
 		state.consecutiveOpenCnt = 0
@@ -457,6 +515,7 @@ func (b *channelCircuitBreaker) RecordFailure(ch *Channel, latency time.Duration
 
 		reopen = state.halfOpen
 		state.halfOpen = false
+		state.probeDeadline = time.Time{}
 		wait = b.nextCooldownLocked(state)
 		state.openUntil = now.Add(wait)
 		state.openReason = openReason
@@ -491,6 +550,7 @@ func (b *channelCircuitBreaker) RecordWhitelistedFailure(ch *Channel, latency ti
 		state.lastFailureStatus = statusCode
 		state.openUntil = time.Time{}
 		state.halfOpen = false
+		state.probeDeadline = time.Time{}
 		state.openReason = ""
 		state.currentCooldown = 0
 		state.consecutiveOpenCnt = 0
@@ -797,6 +857,12 @@ func (b *channelCircuitBreaker) stateTTL(state *channelCircuitState, now time.Ti
 		}
 		if state.currentCooldown > b.cfg.Cooldown {
 			ttl += state.currentCooldown - b.cfg.Cooldown
+		}
+		// 半开探测在途时，TTL 至少要覆盖探测 deadline，避免状态在探测期间过期
+		if state.halfOpen && state.probeDeadline.After(now) {
+			if probeTTL := state.probeDeadline.Sub(now) + b.cfg.FailureWindow + time.Minute; probeTTL > ttl {
+				ttl = probeTTL
+			}
 		}
 	}
 	if ttl <= 0 {

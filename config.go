@@ -238,6 +238,10 @@ type CircuitBreakerConfig struct {
 	StreamSlowThreshold    time.Duration
 	NonStreamSlowThreshold time.Duration
 	SlowRateThreshold      float64
+	// ProbeTimeout 限制单次半开探测的在途时长。探测请求若在此时间内既没有记成功也没有
+	// 记失败（例如处理探测响应的钩子 panic、进程异常路径），则视同放弃，
+	// 后续请求可以重新发起探测，避免渠道永久卡在半开状态。为空时默认 1 分钟。
+	ProbeTimeout time.Duration
 }
 
 func DefaultRetry() RetryConfig {

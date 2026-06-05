@@ -135,6 +135,11 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 			if !shouldRecordAttemptFailureForCircuit(&channels[i]) {
 				p.recordCircuitFailure(r, ctx, &channels[i], err)
 			}
+			if probeMode {
+				// 探测失败但未计入熔断（如 4xx 不记账、客户端取消）时，halfOpen 不会被
+				// RecordFailure 复位，必须显式取消探测，否则渠道会永久卡在半开状态被跳过。
+				p.breaker.CancelProbe(&channels[i])
+			}
 			if !p.shouldContinueToNextChannel(ctx, &channels[i], channelRetryCfg, err) {
 				return result
 			}
@@ -154,6 +159,9 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 			err = errEmptyResponseTryChannels
 			result.lastErr = err
 			p.handleChannelAttemptFailure(r, ctx, nil, err, &result.lastResp)
+			if probeMode {
+				p.breaker.CancelProbe(&channels[i])
+			}
 			continue
 		}
 		result.successResp = resp

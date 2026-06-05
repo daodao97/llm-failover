@@ -1,6 +1,7 @@
 package failover
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -489,6 +490,135 @@ func TestTryChannelsHalfOpenProbeDoesNotHideFailureWithRetries(t *testing.T) {
 		if snapshot.ChannelName == "bad" && snapshot.Status != "open" {
 			t.Fatalf("bad channel status=%s, want=open", snapshot.Status)
 		}
+	}
+}
+
+func TestTryChannelsProbeUncountedFailureReleasesHalfOpen(t *testing.T) {
+	// 探测拿到 400（默认不计入熔断的失败）不应让渠道永久卡在半开状态
+	testProbeInconclusiveReleasesHalfOpen(t, func() (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+		}, nil
+	})
+}
+
+func TestTryChannelsProbeClientCancelReleasesHalfOpen(t *testing.T) {
+	// 探测期间客户端取消（不计入熔断）不应让渠道永久卡在半开状态
+	testProbeInconclusiveReleasesHalfOpen(t, func() (*http.Response, error) {
+		return nil, context.Canceled
+	})
+}
+
+// testProbeInconclusiveReleasesHalfOpen 验证半开探测结果"无结论"（失败但未计入熔断）时，
+// halfOpen 会被复位，后续请求可以重新发起探测并最终恢复渠道。
+func testProbeInconclusiveReleasesHalfOpen(t *testing.T, probeResult func() (*http.Response, error)) {
+	t.Helper()
+	badAttempts := 0
+	goodAttempts := 0
+	badMode := "fail" // fail -> probe -> ok
+	channels := []Channel{
+		{
+			Id:      1,
+			Name:    "bad",
+			BaseURL: "https://bad.example.com",
+			Enabled: true,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "bad-key", Value: "bad-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				badAttempts++
+				switch badMode {
+				case "probe":
+					return probeResult()
+				case "ok":
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       http.NoBody,
+					}, nil
+				default:
+					return &http.Response{
+						StatusCode: http.StatusBadGateway,
+						Header:     make(http.Header),
+						Body:       http.NoBody,
+					}, nil
+				}
+			},
+		},
+		{
+			Id:      2,
+			Name:    "good",
+			BaseURL: "https://good.example.com",
+			Enabled: true,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "good-key", Value: "good-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				goodAttempts++
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       http.NoBody,
+				}, nil
+			},
+		},
+	}
+
+	p := New(Config{
+		Retry: NoRetry(),
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         2,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Second,
+			Cooldown:           20 * time.Millisecond,
+		},
+	})
+
+	// 两次 502 失败打开熔断
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+		ctx := &Context{Request: req}
+		result := p.tryChannels(req, ctx, channels, NoRetry())
+		if result.successResp == nil {
+			t.Fatalf("request %d should succeed on fallback channel", i+1)
+		}
+		writeSuccessfulPipelineResult(t, p, req, ctx, result)
+	}
+	if badAttempts != 2 {
+		t.Fatalf("badAttempts=%d, want=2 before circuit opens", badAttempts)
+	}
+
+	// 冷却结束后第一次探测：失败但不计入熔断（无结论）
+	time.Sleep(40 * time.Millisecond)
+	badMode = "probe"
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	ctx := &Context{Request: req}
+	result := p.tryChannels(req, ctx, channels, NoRetry())
+	if result.successResp != nil {
+		t.Fatalf("inconclusive probe request should not succeed")
+	}
+	p.writePipelineResponse(httptest.NewRecorder(), req, ctx, result)
+	if badAttempts != 3 {
+		t.Fatalf("badAttempts=%d, want=3 because probe should reach bad channel", badAttempts)
+	}
+
+	// 无结论的探测不应让渠道卡死在半开状态：下一个请求应能再次探测并恢复渠道
+	badMode = "ok"
+	req = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	ctx = &Context{Request: req}
+	result = p.tryChannels(req, ctx, channels, NoRetry())
+	if result.successResp == nil {
+		t.Fatalf("recovery probe should succeed")
+	}
+	writeSuccessfulPipelineResult(t, p, req, ctx, result)
+	if badAttempts != 4 {
+		t.Fatalf("badAttempts=%d, want=4: channel stuck in half-open after inconclusive probe", badAttempts)
+	}
+	if goodAttempts != 2 {
+		t.Fatalf("goodAttempts=%d, want=2", goodAttempts)
 	}
 }
 
@@ -1045,6 +1175,53 @@ func TestChannelCircuitBreakerCooldownBackoffUntilRecovery(t *testing.T) {
 	}
 	if wait != 10*time.Second {
 		t.Fatalf("post-recovery wait=%s, want reset to 10s", wait)
+	}
+}
+
+// TestChannelCircuitBreakerAbandonedProbeReleasedAfterDeadline 验证半开探测被"放弃"
+// （既没有记成功也没有记失败，例如钩子 panic）时，超过 ProbeTimeout 后
+// 后续请求可以重新发起探测，渠道不会永久卡在半开状态。
+func TestChannelCircuitBreakerAbandonedProbeReleasedAfterDeadline(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	breaker := newChannelCircuitBreaker("abandoned-probe", CircuitBreakerConfig{
+		Enabled:            true,
+		MinSamples:         1,
+		ErrorRateThreshold: 1,
+		FailureWindow:      time.Minute,
+		Cooldown:           10 * time.Second,
+		ProbeTimeout:       30 * time.Second,
+	})
+	breaker.now = func() time.Time { return now }
+
+	ch := &Channel{Id: 1, Name: "bad"}
+
+	if opened, _, _, _ := breaker.RecordFailure(ch, 0, false, http.StatusBadGateway); !opened {
+		t.Fatalf("circuit should open after failure")
+	}
+
+	// 冷却结束后第一次探测被授予
+	now = now.Add(11 * time.Second)
+	if allowed, _, probe := breaker.Allow(ch); !allowed || !probe {
+		t.Fatalf("first probe should be granted: allowed=%v probe=%v", allowed, probe)
+	}
+
+	// 探测在途（deadline 内）：其他请求被拒
+	if allowed, _, _ := breaker.Allow(ch); allowed {
+		t.Fatalf("requests during in-flight probe should be blocked")
+	}
+
+	// 探测被放弃：超过 ProbeTimeout 后应重新授予探测，而不是永久阻塞
+	now = now.Add(31 * time.Second)
+	if allowed, _, probe := breaker.Allow(ch); !allowed || !probe {
+		t.Fatalf("abandoned probe should be released after deadline: allowed=%v probe=%v", allowed, probe)
+	}
+
+	// 新探测成功后渠道恢复
+	if opened, _, _ := breaker.RecordSuccess(ch, 0, false); opened {
+		t.Fatalf("probe success should recover the channel")
+	}
+	if allowed, _, probe := breaker.Allow(ch); !allowed || probe {
+		t.Fatalf("recovered channel should allow normal traffic: allowed=%v probe=%v", allowed, probe)
 	}
 }
 
