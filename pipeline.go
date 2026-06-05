@@ -18,15 +18,16 @@ import (
 
 var requestIDAnnotationPattern = regexp.MustCompile(`(?i)\s*\(request id:\s*[^)]+\)`)
 
-// prepareRequestBody 预读请求体，用于重试场景下复用
-func (p *Proxy) prepareRequestBody(w http.ResponseWriter, ctx *Context) bool {
+// prepareRequestBody 预读请求体，用于重试场景下复用。
+// 失败时已写回错误响应，返回的 error 供调用方上报（如 Observer.OnRequestDone）。
+func (p *Proxy) prepareRequestBody(w http.ResponseWriter, ctx *Context) error {
 	var bodyBytes []byte
 	if ctx.Request.Body != nil {
 		var err error
 		bodyBytes, err = io.ReadAll(ctx.Request.Body)
 		if err != nil {
 			p.writeGeneratedErrorResponse(w, ctx, "invalid_request_error", "failed to read request body", http.StatusBadRequest, err)
-			return false
+			return fmt.Errorf("read request body failed: %w", err)
 		}
 		ctx.Request.Body.Close()
 	}
@@ -36,21 +37,23 @@ func (p *Proxy) prepareRequestBody(w http.ResponseWriter, ctx *Context) bool {
 	if len(bodyBytes) > 0 {
 		ctx.OriginalRequestBody = cloneBytes(bodyBytes)
 	}
-	return true
+	return nil
 }
 
-// selectChannels 阶段一：选择可用渠道
-func (p *Proxy) selectChannels(w http.ResponseWriter, r *http.Request, ctx *Context) ([]Channel, bool) {
+// selectChannels 阶段一：选择可用渠道。
+// 失败时已写回错误响应，返回的 error 供调用方上报（如 Observer.OnRequestDone）。
+func (p *Proxy) selectChannels(w http.ResponseWriter, r *http.Request, ctx *Context) ([]Channel, error) {
 	channels, err := p.enabledChannels(cloneRequestWithBody(r, ctx.RequestBody))
 	if err != nil {
 		p.writeGeneratedErrorResponse(w, ctx, "api_error", err.Error(), classifySelectChannelsStatus(err), err)
-		return nil, false
+		return nil, err
 	}
 	if len(channels) == 0 {
-		p.writeGeneratedErrorResponse(w, ctx, "api_error", "no channels available", http.StatusServiceUnavailable, errors.New("没有可用渠道"))
-		return nil, false
+		err := errors.New("no channels available")
+		p.writeGeneratedErrorResponse(w, ctx, "api_error", err.Error(), http.StatusServiceUnavailable, err)
+		return nil, err
 	}
-	return channels, true
+	return channels, nil
 }
 
 func classifySelectChannelsStatus(err error) int {
@@ -90,7 +93,7 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 			} else if allowed, wait, probe := p.breaker.Allow(&channels[i]); !allowed {
 				channelName := MaskChannelName(strconv.Itoa(channels[i].Id))
 				if result.lastErr == nil {
-					result.lastErr = fmt.Errorf("channel circuit open: [%s] %s", channelName, "CC")
+					result.lastErr = fmt.Errorf("channel circuit open: [%s]", channelName)
 				}
 				p.observer().OnChannelSkipped(ctx, &channels[i], "circuit_open")
 				p.logger().InfoCtx(r.Context(), "channel skipped by circuit breaker",
@@ -178,6 +181,16 @@ func shouldRecordAttemptFailureForCircuit(ch *Channel) bool {
 	return ch.CType != CTypePool
 }
 
+// circuitFailureStatusCode 返回用于失败记账的状态码。
+// 非错误状态码（例如 SSE 断流时的 200）不具失败语义，返回 0 表示"无失败状态码"，
+// 避免健康快照把 200 显示为最后一次失败状态。
+func circuitFailureStatusCode(ctx *Context) int {
+	if ctx == nil || ctx.LastStatusCode < http.StatusBadRequest {
+		return 0
+	}
+	return ctx.LastStatusCode
+}
+
 func (p *Proxy) recordCircuitFailure(r *http.Request, ctx *Context, ch *Channel, err error) bool {
 	if p == nil || p.breaker == nil || ctx == nil || ch == nil || err == nil {
 		return false
@@ -187,14 +200,14 @@ func (p *Proxy) recordCircuitFailure(r *http.Request, ctx *Context, ch *Channel,
 		if IsContextDoneError(err) {
 			return false
 		}
-		p.breaker.RecordWhitelistedFailure(ch, latency, stream, ctx.LastStatusCode)
+		p.breaker.RecordWhitelistedFailure(ch, latency, stream, circuitFailureStatusCode(ctx))
 		return false
 	}
 	if IsContextDoneError(err) || !p.shouldCountChannelFailureForCircuit(ctx, ch, err) {
 		return false
 	}
 
-	opened, reopen, wait, reason := p.breaker.RecordFailure(ch, latency, stream, ctx.LastStatusCode)
+	opened, reopen, wait, reason := p.breaker.RecordFailure(ch, latency, stream, circuitFailureStatusCode(ctx))
 	if !opened {
 		return false
 	}
@@ -330,8 +343,26 @@ func (p *Proxy) writePipelineResponse(w http.ResponseWriter, r *http.Request, ct
 	p.writeResponse(w, result.lastResp, ctx)
 }
 
+// streamInterruptionError 把上游侧的响应体读错误包装为最终错误。
+// 客户端断开导致的断流（context done）返回 nil——那不是渠道的问题。
+func streamInterruptionError(ctx *Context) error {
+	if ctx == nil || ctx.StreamReadErr == nil || IsContextDoneError(ctx.StreamReadErr) {
+		return nil
+	}
+	return fmt.Errorf("upstream stream interrupted: %w", ctx.StreamReadErr)
+}
+
 func (p *Proxy) recordChannelSuccess(r *http.Request, ctx *Context) {
 	if p == nil || p.breaker == nil || ctx == nil || ctx.Channel == nil {
+		return
+	}
+	// 上游响应体中途断流（如 SSE 半路断）不算成功：按失败记账。
+	if err := streamInterruptionError(ctx); err != nil {
+		p.recordCircuitFailure(r, ctx, ctx.Channel, err)
+		return
+	}
+	// 客户端断开导致的断流：既不记失败也不记成功
+	if ctx.StreamReadErr != nil {
 		return
 	}
 	latency, stream := circuitObservation(ctx)
@@ -571,18 +602,7 @@ func (p *Proxy) handleChannelAttemptFailure(r *http.Request, ctx *Context, resp 
 	}
 
 	if p.cfg.OnChannelFail != nil {
-		p.logger().InfoCtx(r.Context(), "calling OnChannelFail",
-			"channel", ctx.Channel.Name,
-			"attempt", ctx.Attempt,
-			"status", ctx.LastStatusCode,
-		)
 		p.cfg.OnChannelFail(ctx, err)
-	} else {
-		p.logger().InfoCtx(r.Context(), "OnChannelFail is nil",
-			"channel", ctx.Channel.Name,
-			"attempt", ctx.Attempt,
-			"status", ctx.LastStatusCode,
-		)
 	}
 
 	if resp != nil {

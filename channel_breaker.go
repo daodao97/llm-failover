@@ -1,6 +1,7 @@
 package failover
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -15,6 +16,8 @@ const (
 	defaultChannelCircuitFailureWindow      = 30 * time.Second
 	defaultChannelCircuitCooldown           = 15 * time.Second
 	defaultChannelCircuitProbeTimeout       = time.Minute
+	defaultChannelCircuitMaxCooldownFactor  = 16
+	defaultChannelCircuitMaxWindowSamples   = 2048
 )
 
 type ChannelHealthSnapshot struct {
@@ -127,10 +130,14 @@ func (e *memoryChannelCircuitEntry) expired(now time.Time) bool {
 
 // channelCircuitBreaker 维护渠道短时间失败状态，避免持续串行试错。
 type channelCircuitBreaker struct {
-	now   func() time.Time
-	scope string
-	cfg   CircuitBreakerConfig
-	store CircuitBreakerStore
+	now    func() time.Time
+	scope  string
+	cfg    CircuitBreakerConfig
+	store  CircuitBreakerStore
+	logger Logger
+
+	errLogMu     sync.Mutex
+	lastErrLogAt time.Time
 }
 
 type channelEventSummary struct {
@@ -179,14 +186,14 @@ func newChannelCircuitBreaker(scope string, cfg CircuitBreakerConfig, stores ...
 	if len(stores) > 0 && stores[0] != nil {
 		store = stores[0]
 	}
-	breaker := &channelCircuitBreaker{
+	// 注意：不在此处注册进全局 registry。注册由调用方（New）在完成 logger 等
+	// 字段初始化后进行，避免实例在初始化完成前被并发访问（data race）。
+	return &channelCircuitBreaker{
 		now:   time.Now,
 		scope: scope,
 		cfg:   cfg,
 		store: store,
 	}
-	globalChannelBreakerRegistry.register(breaker)
-	return breaker
 }
 
 func newMemoryChannelCircuitStore() *memoryChannelCircuitStore {
@@ -303,6 +310,15 @@ func normalizeCircuitBreakerConfig(cfg CircuitBreakerConfig) CircuitBreakerConfi
 	if cfg.ProbeTimeout <= 0 {
 		cfg.ProbeTimeout = defaultChannelCircuitProbeTimeout
 	}
+	if cfg.MaxCooldown <= 0 {
+		cfg.MaxCooldown = defaultChannelCircuitMaxCooldownFactor * cfg.Cooldown
+	}
+	if cfg.MaxCooldown < cfg.Cooldown {
+		cfg.MaxCooldown = cfg.Cooldown
+	}
+	if cfg.MaxWindowSamples <= 0 {
+		cfg.MaxWindowSamples = defaultChannelCircuitMaxWindowSamples
+	}
 	if effectiveStreamSlowThreshold(cfg) > 0 && cfg.SlowRateThreshold <= 0 {
 		cfg.SlowRateThreshold = 1
 	}
@@ -350,9 +366,45 @@ func (b *channelCircuitBreaker) Allow(ch *Channel) (bool, time.Duration, bool) {
 		return false, b.stateTTL(state, now)
 	})
 	if err != nil {
+		b.logStoreError("allow", err)
 		return true, 0, false
 	}
 	return allowed, wait, probe
+}
+
+// appendEvent 在窗口内追加一条事件：先按时间裁剪，再按 MaxWindowSamples 裁剪条数（丢最旧）。
+func (b *channelCircuitBreaker) appendEvent(state *channelCircuitState, event channelCircuitEvent, now time.Time) {
+	events := append(trimEvents(state.events, now, b.cfg.FailureWindow), event)
+	if max := b.cfg.MaxWindowSamples; max > 0 && len(events) > max {
+		events = append([]channelCircuitEvent(nil), events[len(events)-max:]...)
+	}
+	state.events = events
+}
+
+// logStoreError 在 store 操作失败时打节流告警。
+// 熔断器对 store 错误的策略是 fail-open（放行请求），但失效必须可见，
+// 否则 Redis 故障时熔断会静默消失。30 秒节流避免日志风暴。
+func (b *channelCircuitBreaker) logStoreError(op string, err error) {
+	if b == nil || err == nil {
+		return
+	}
+
+	now := b.now()
+	b.errLogMu.Lock()
+	throttled := !b.lastErrLogAt.IsZero() && now.Sub(b.lastErrLogAt) < 30*time.Second
+	if !throttled {
+		b.lastErrLogAt = now
+	}
+	b.errLogMu.Unlock()
+	if throttled {
+		return
+	}
+
+	normalizeLogger(b.logger).WarnCtx(context.Background(), "circuit breaker store error, degrading to fail-open",
+		"op", op,
+		"scope", b.scope,
+		"error", err,
+	)
 }
 
 // CancelProbe 在半开探测无结论时复位 halfOpen，让后续请求可以重新发起探测。
@@ -364,7 +416,7 @@ func (b *channelCircuitBreaker) CancelProbe(ch *Channel) {
 	}
 
 	now := b.now()
-	_ = b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		if !state.halfOpen {
 			return false, b.stateTTL(state, now)
 		}
@@ -373,6 +425,7 @@ func (b *channelCircuitBreaker) CancelProbe(ch *Channel) {
 		state.updatedAt = now
 		return false, b.stateTTL(state, now)
 	})
+	b.logStoreError("cancel_probe", err)
 }
 
 func (b *channelCircuitBreaker) TrackChannel(ch *Channel, circuitBreakerWhitelisted bool) {
@@ -381,12 +434,13 @@ func (b *channelCircuitBreaker) TrackChannel(ch *Channel, circuitBreakerWhitelis
 	}
 
 	now := b.now()
-	_ = b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		updateChannelCircuitStateMetadata(state, ch)
 		state.circuitBreakerWhitelisted = circuitBreakerWhitelisted
 		state.updatedAt = now
 		return false, b.stateTTL(state, now)
 	})
+	b.logStoreError("track_channel", err)
 }
 
 func (b *channelCircuitBreaker) RecordSuccess(ch *Channel, latency time.Duration, stream bool) (opened bool, wait time.Duration, reason string) {
@@ -405,7 +459,7 @@ func (b *channelCircuitBreaker) RecordSuccess(ch *Channel, latency time.Duration
 			slow:    isSlowEvent(latency, stream, b.cfg),
 			stream:  stream,
 		}
-		state.events = append(trimEvents(state.events, now, b.cfg.FailureWindow), event)
+		b.appendEvent(state, event, now)
 		state.updatedAt = now
 		state.lastLatency = latency
 
@@ -444,6 +498,7 @@ func (b *channelCircuitBreaker) RecordSuccess(ch *Channel, latency time.Duration
 		return false, b.stateTTL(state, now)
 	})
 	if err != nil {
+		b.logStoreError("record_success", err)
 		return false, 0, ""
 	}
 	return opened, wait, reason
@@ -455,16 +510,16 @@ func (b *channelCircuitBreaker) RecordWhitelistedSuccess(ch *Channel, latency ti
 	}
 
 	now := b.now()
-	_ = b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		updateChannelCircuitStateMetadata(state, ch)
 		state.circuitBreakerWhitelisted = true
-		state.events = append(trimEvents(state.events, now, b.cfg.FailureWindow), channelCircuitEvent{
+		b.appendEvent(state, channelCircuitEvent{
 			at:      now,
 			success: true,
 			latency: latency,
 			slow:    isSlowEvent(latency, stream, b.cfg),
 			stream:  stream,
-		})
+		}, now)
 		state.updatedAt = now
 		state.lastLatency = latency
 		state.openUntil = time.Time{}
@@ -475,6 +530,7 @@ func (b *channelCircuitBreaker) RecordWhitelistedSuccess(ch *Channel, latency ti
 		state.consecutiveOpenCnt = 0
 		return false, b.stateTTL(state, now)
 	})
+	b.logStoreError("record_whitelisted_success", err)
 }
 
 func (b *channelCircuitBreaker) RecordFailure(ch *Channel, latency time.Duration, stream bool, statusCode int) (opened bool, reopen bool, wait time.Duration, reason string) {
@@ -493,10 +549,12 @@ func (b *channelCircuitBreaker) RecordFailure(ch *Channel, latency time.Duration
 			slow:    isSlowEvent(latency, stream, b.cfg),
 			stream:  stream,
 		}
-		state.events = append(trimEvents(state.events, now, b.cfg.FailureWindow), event)
+		b.appendEvent(state, event, now)
 		state.updatedAt = now
 		state.lastLatency = latency
-		state.lastFailureStatus = statusCode
+		if statusCode != 0 {
+			state.lastFailureStatus = statusCode
+		}
 
 		summary := summarizeEvents(state.events)
 		errorRate := 0.0
@@ -524,6 +582,7 @@ func (b *channelCircuitBreaker) RecordFailure(ch *Channel, latency time.Duration
 		return false, b.stateTTL(state, now)
 	})
 	if err != nil {
+		b.logStoreError("record_failure", err)
 		return false, false, 0, ""
 	}
 	return opened, reopen, wait, reason
@@ -535,19 +594,21 @@ func (b *channelCircuitBreaker) RecordWhitelistedFailure(ch *Channel, latency ti
 	}
 
 	now := b.now()
-	_ = b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		updateChannelCircuitStateMetadata(state, ch)
 		state.circuitBreakerWhitelisted = true
-		state.events = append(trimEvents(state.events, now, b.cfg.FailureWindow), channelCircuitEvent{
+		b.appendEvent(state, channelCircuitEvent{
 			at:      now,
 			success: false,
 			latency: latency,
 			slow:    isSlowEvent(latency, stream, b.cfg),
 			stream:  stream,
-		})
+		}, now)
 		state.updatedAt = now
 		state.lastLatency = latency
-		state.lastFailureStatus = statusCode
+		if statusCode != 0 {
+			state.lastFailureStatus = statusCode
+		}
 		state.openUntil = time.Time{}
 		state.halfOpen = false
 		state.probeDeadline = time.Time{}
@@ -556,6 +617,7 @@ func (b *channelCircuitBreaker) RecordWhitelistedFailure(ch *Channel, latency ti
 		state.consecutiveOpenCnt = 0
 		return false, b.stateTTL(state, now)
 	})
+	b.logStoreError("record_whitelisted_failure", err)
 }
 
 func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
@@ -566,6 +628,7 @@ func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
 	now := b.now()
 	entries, err := b.store.snapshot(b.scope)
 	if err != nil {
+		b.logStoreError("snapshot", err)
 		return nil
 	}
 	snapshots := make([]ChannelHealthSnapshot, 0, len(entries))
@@ -685,6 +748,7 @@ func (b *channelCircuitBreaker) Reset() int {
 
 	count, err := b.store.reset(b.scope)
 	if err != nil {
+		b.logStoreError("reset", err)
 		return 0
 	}
 	return count
@@ -704,6 +768,7 @@ func (b *channelCircuitBreaker) ResetChannelByKey(channelKey string) bool {
 
 	ok, err := b.store.resetChannelByKey(b.scope, channelKey)
 	if err != nil {
+		b.logStoreError("reset_channel", err)
 		return false
 	}
 	return ok
@@ -716,6 +781,20 @@ func (r *channelBreakerRegistry) register(b *channelCircuitBreaker) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.breakers = append(r.breakers, b)
+}
+
+func (r *channelBreakerRegistry) unregister(b *channelCircuitBreaker) {
+	if b == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, item := range r.breakers {
+		if item == b {
+			r.breakers = append(r.breakers[:i], r.breakers[i+1:]...)
+			return
+		}
+	}
 }
 
 func ListChannelHealthSnapshots() []ChannelHealthSnapshot {
@@ -1046,6 +1125,10 @@ func (b *channelCircuitBreaker) nextCooldownLocked(state *channelCircuitState) t
 		next = time.Duration(math.MaxInt64)
 	} else {
 		next *= 2
+	}
+	// 封顶，避免长时间故障后冷却无限增长、拖慢恢复探测
+	if b.cfg.MaxCooldown > 0 && next > b.cfg.MaxCooldown {
+		next = b.cfg.MaxCooldown
 	}
 	state.consecutiveOpenCnt++
 	state.currentCooldown = next

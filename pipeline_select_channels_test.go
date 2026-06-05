@@ -21,8 +21,8 @@ func TestSelectChannelsReturns503WhenNoChannelsAvailable(t *testing.T) {
 	w := httptest.NewRecorder()
 	ctx := &Context{Request: req}
 
-	channels, ok := p.selectChannels(w, req, ctx)
-	if ok {
+	channels, err := p.selectChannels(w, req, ctx)
+	if err == nil {
 		t.Fatal("expected selectChannels to fail")
 	}
 	if channels != nil {
@@ -33,6 +33,42 @@ func TestSelectChannelsReturns503WhenNoChannelsAvailable(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "no channels available") {
 		t.Fatalf("body=%s", w.Body.String())
+	}
+}
+
+type captureDoneObserver struct {
+	noopObserver
+	called  bool
+	doneErr error
+}
+
+func (o *captureDoneObserver) OnRequestDone(ctx *Context, err error) {
+	o.called = true
+	o.doneErr = err
+}
+
+// TestServeHTTPReportsRealErrorToOnRequestDone 验证选渠道失败时 Observer 收到真实错误，
+// 而不是 E_PROXY_EMPTY_RESPONSE_* 守卫错误。
+func TestServeHTTPReportsRealErrorToOnRequestDone(t *testing.T) {
+	obs := &captureDoneObserver{}
+	p := New(Config{
+		Observer: obs,
+		GetChannels: func(r *http.Request) ([]Channel, error) {
+			return nil, nil
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	if !obs.called {
+		t.Fatal("OnRequestDone should be called")
+	}
+	if obs.doneErr == nil {
+		t.Fatal("OnRequestDone should receive the real error")
+	}
+	if !strings.Contains(obs.doneErr.Error(), "no channels available") {
+		t.Fatalf("doneErr=%q, want real cause instead of guard error", obs.doneErr)
 	}
 }
 

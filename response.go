@@ -84,17 +84,24 @@ func (p *Proxy) streamSSEPassthrough(w http.ResponseWriter, body io.Reader, ctx 
 	flusher, _ := w.(http.Flusher)
 	scanner := newSSEScanner(body)
 	var event SSEEvent
+	var dataLines []string
 	var firstEventSent bool
 
 	emitObservedEvent := func() {
+		// 多行 data 按 SSE 语义 join 后再观察，避免只保留最后一行
+		if len(dataLines) > 0 {
+			event.Data = strings.Join(dataLines, "\n")
+		}
+		dataLines = nil
 		if event.Event == "" && event.Data == "" {
+			event = SSEEvent{}
 			return
 		}
 		var channel *Channel
 		if ctx != nil {
 			channel = ctx.Channel
 		}
-		if !firstEventSent && ctx.Stats != nil {
+		if ctx != nil && !firstEventSent && ctx.Stats != nil {
 			ctx.Stats.FirstEventTime = time.Since(ctx.Stats.RequestStart)
 			firstEventSent = true
 		}
@@ -102,6 +109,7 @@ func (p *Proxy) streamSSEPassthrough(w http.ResponseWriter, body io.Reader, ctx 
 		if p.cfg.OnSSE != nil {
 			p.cfg.OnSSE(ctx, &event)
 		}
+		event = SSEEvent{}
 	}
 
 	for scanner.Scan() {
@@ -112,13 +120,12 @@ func (p *Proxy) streamSSEPassthrough(w http.ResponseWriter, body io.Reader, ctx 
 		case strings.HasPrefix(line, "event:"):
 			event.Event = strings.TrimSpace(line[6:])
 		case strings.HasPrefix(line, "data:"):
-			event.Data = strings.TrimSpace(line[5:])
+			dataLines = append(dataLines, strings.TrimSpace(line[5:]))
 		case strings.HasPrefix(line, "id:"):
 			event.ID = strings.TrimSpace(line[3:])
 		case line == "":
 			// 空行表示事件结束
 			emitObservedEvent()
-			event = SSEEvent{}
 		}
 
 		fmt.Fprintf(w, "%s\n", line)
@@ -127,12 +134,15 @@ func (p *Proxy) streamSSEPassthrough(w http.ResponseWriter, body io.Reader, ctx 
 		}
 	}
 	emitObservedEvent()
-	if err := scanner.Err(); err != nil && ctx != nil && ctx.Request != nil {
-		p.logger().WarnCtx(ctx.Request.Context(), "sse passthrough scan failed", "error", err)
+	if err := scanner.Err(); err != nil && ctx != nil {
+		ctx.StreamReadErr = err
+		if ctx.Request != nil {
+			p.logger().WarnCtx(ctx.Request.Context(), "sse passthrough scan failed", "error", err)
+		}
 	}
 
 	// 记录流完成时间
-	if ctx.Stats != nil {
+	if ctx != nil && ctx.Stats != nil {
 		ctx.Stats.StreamDuration = time.Since(ctx.Stats.RequestStart)
 		ctx.Stats.TotalDuration = ctx.Stats.StreamDuration
 	}
@@ -203,7 +213,7 @@ func (p *Proxy) streamSSEWithTransform(w http.ResponseWriter, body io.Reader, ct
 			if p.cfg.FilterSSE != nil && !p.cfg.FilterSSE(ctx, ev) {
 				continue
 			}
-			if (ev.Event != "" || ev.Data != "") && !firstEventSent && ctx.Stats != nil {
+			if (ev.Event != "" || ev.Data != "") && !firstEventSent && ctx != nil && ctx.Stats != nil {
 				ctx.Stats.FirstEventTime = time.Since(ctx.Stats.RequestStart)
 				firstEventSent = true
 			}
@@ -229,11 +239,14 @@ func (p *Proxy) streamSSEWithTransform(w http.ResponseWriter, body io.Reader, ct
 			p.logger().WarnCtx(ctx.Request.Context(), "drop incomplete sse block at eof", "lines", len(block))
 		}
 	}
-	if err := scanner.Err(); err != nil && ctx != nil && ctx.Request != nil {
-		p.logger().WarnCtx(ctx.Request.Context(), "sse transform scan failed", "error", err)
+	if err := scanner.Err(); err != nil && ctx != nil {
+		ctx.StreamReadErr = err
+		if ctx.Request != nil {
+			p.logger().WarnCtx(ctx.Request.Context(), "sse transform scan failed", "error", err)
+		}
 	}
 
-	if ctx.Stats != nil {
+	if ctx != nil && ctx.Stats != nil {
 		ctx.Stats.StreamDuration = time.Since(ctx.Stats.RequestStart)
 		ctx.Stats.TotalDuration = ctx.Stats.StreamDuration
 	}
@@ -261,9 +274,12 @@ func parseSSEBlock(lines []string) SSEEvent {
 
 // streamBody 处理普通 JSON 响应体
 func (p *Proxy) streamBody(w http.ResponseWriter, body io.Reader, ctx *Context) {
-	data, _ := io.ReadAll(body)
+	data, err := io.ReadAll(body)
+	if err != nil && ctx != nil {
+		ctx.StreamReadErr = err
+	}
 
-	if ctx.Stats != nil {
+	if ctx != nil && ctx.Stats != nil {
 		ctx.Stats.TotalDuration = time.Since(ctx.Stats.RequestStart)
 	}
 

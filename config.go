@@ -39,6 +39,11 @@ type Config struct {
 	// ShouldCountFailureForCircuit 允许业务层自定义哪些失败应计入熔断。
 	// 返回 true 表示将本次失败记入熔断窗口；返回 false 表示忽略。
 	// 为 nil 时使用框架默认规则。
+	//
+	// 注意：上游断流（响应体半路读失败）也会经过此钩子，此时 ctx.LastStatusCode
+	// 是成功状态码（如 200），错误为 "upstream stream interrupted: ..."。
+	// 只按状态码判断的实现（如 code >= 500）会漏掉这类失败，
+	// 建议同时检查 ctx.StreamReadErr 或错误内容。
 	ShouldCountFailureForCircuit func(ctx *Context, ch *Channel, err error) bool
 
 	// 钩子
@@ -88,6 +93,9 @@ type Context struct {
 	PoolStats          PoolStats
 	FailoverDeadline   time.Time
 	AttemptDeadline    time.Time
+	// StreamReadErr 记录转发响应体时上游侧的读错误（如 SSE 半路断流）。
+	// 客户端断开会以 context 取消的形式出现，不计入渠道失败。
+	StreamReadErr error
 }
 
 func (c *Context) resetForChannel() {
@@ -107,6 +115,7 @@ func (c *Context) resetForChannel() {
 	c.LastResponseHeader = nil
 	c.LastResponseBody = nil
 	c.PoolStats = PoolStats{}
+	c.StreamReadErr = nil
 	c.RequestBody = cloneBytes(c.OriginalRequestBody)
 }
 
@@ -242,6 +251,12 @@ type CircuitBreakerConfig struct {
 	// 记失败（例如处理探测响应的钩子 panic、进程异常路径），则视同放弃，
 	// 后续请求可以重新发起探测，避免渠道永久卡在半开状态。为空时默认 1 分钟。
 	ProbeTimeout time.Duration
+	// MaxCooldown 限制连续熔断时指数退避冷却的上限，避免长时间故障后冷却涨到数小时，
+	// 导致上游恢复后渠道仍长期闲置。为空时默认 16 倍 Cooldown。
+	MaxCooldown time.Duration
+	// MaxWindowSamples 限制失败窗口内保留的事件条数，超出时丢弃最旧事件，
+	// 防止高 QPS 渠道的窗口状态无限增长（内存与 Redis 序列化体积）。为空时默认 2048。
+	MaxWindowSamples int
 }
 
 func DefaultRetry() RetryConfig {

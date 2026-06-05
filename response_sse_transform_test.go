@@ -153,6 +153,33 @@ func TestStreamSSEWithTransformDropsIncompleteEventAtEOFBeforeHooks(t *testing.T
 	}
 }
 
+// TestStreamSSEPassthroughObservesMultiDataLines 验证 passthrough 路径观察多行 data 事件时
+// 按 SSE 语义 join，而不是只保留最后一行。
+func TestStreamSSEPassthroughObservesMultiDataLines(t *testing.T) {
+	var observed []SSEEvent
+	p := New(Config{
+		OnSSE: func(ctx *Context, event *SSEEvent) {
+			observed = append(observed, *event)
+		},
+	})
+
+	body := "event: message\ndata: line-1\ndata: line-2\n\n"
+	w := httptest.NewRecorder()
+	ctx := &Context{}
+	p.streamSSEPassthrough(w, strings.NewReader(body), ctx)
+
+	if len(observed) != 1 {
+		t.Fatalf("observed %d events, want 1", len(observed))
+	}
+	if observed[0].Data != "line-1\nline-2" {
+		t.Fatalf("Data=%q, want joined multi-line data", observed[0].Data)
+	}
+	// 透传输出不受观察逻辑影响
+	if got := w.Body.String(); got != body {
+		t.Fatalf("passthrough output changed: %q", got)
+	}
+}
+
 func TestParseSSEBlockCollectsMultiDataLines(t *testing.T) {
 	event := parseSSEBlock([]string{
 		"event: content_block_delta",

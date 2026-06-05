@@ -1178,6 +1178,272 @@ func TestChannelCircuitBreakerCooldownBackoffUntilRecovery(t *testing.T) {
 	}
 }
 
+// TestProxyCloseUnregistersBreaker 验证 Close 后 Proxy 的熔断器不再出现在全局快照中。
+func TestProxyCloseUnregistersBreaker(t *testing.T) {
+	newProxy := func(scope string) *Proxy {
+		return New(Config{
+			BreakerScope: scope,
+			CircuitBreaker: CircuitBreakerConfig{
+				Enabled:    true,
+				MinSamples: 1,
+			},
+		})
+	}
+	hasScope := func(scope string) bool {
+		for _, snapshot := range ListChannelHealthSnapshots() {
+			if snapshot.Scope == scope {
+				return true
+			}
+		}
+		return false
+	}
+
+	p1 := newProxy("close-test-1")
+	p2 := newProxy("close-test-2")
+	defer p2.Close()
+	ch := &Channel{Id: 1, Name: "ch"}
+	p1.breaker.RecordFailure(ch, 0, false, http.StatusBadGateway)
+	p2.breaker.RecordFailure(ch, 0, false, http.StatusBadGateway)
+
+	if !hasScope("close-test-1") || !hasScope("close-test-2") {
+		t.Fatal("both scopes should appear before Close")
+	}
+
+	p1.Close()
+	if hasScope("close-test-1") {
+		t.Fatal("closed proxy's breaker should be unregistered")
+	}
+	if !hasScope("close-test-2") {
+		t.Fatal("other proxy's breaker should remain registered")
+	}
+}
+
+// TestChannelCircuitBreakerCapsWindowSamples 验证窗口事件条数被 MaxWindowSamples 封顶。
+func TestChannelCircuitBreakerCapsWindowSamples(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	breaker := newChannelCircuitBreaker("window-cap", CircuitBreakerConfig{
+		Enabled:            true,
+		MinSamples:         1000, // 不触发熔断，只看事件累计
+		ErrorRateThreshold: 1,
+		FailureWindow:      time.Hour,
+		Cooldown:           time.Second,
+		MaxWindowSamples:   5,
+	})
+	breaker.now = func() time.Time { return now }
+
+	ch := &Channel{Id: 1, Name: "busy"}
+	for i := 0; i < 10; i++ {
+		breaker.RecordSuccess(ch, time.Millisecond, false)
+		now = now.Add(time.Millisecond)
+	}
+
+	snapshots := breaker.Snapshot()
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshot len=%d, want=1", len(snapshots))
+	}
+	if got := snapshots[0].RequestCount; got != 5 {
+		t.Fatalf("RequestCount=%d, want=5 (capped)", got)
+	}
+}
+
+// errorAfterReader 先返回 data，读完后返回 err，模拟上游响应体半路断流。
+type errorAfterReader struct {
+	data []byte
+	err  error
+	pos  int
+}
+
+func (r *errorAfterReader) Read(p []byte) (int, error) {
+	if r.pos < len(r.data) {
+		n := copy(p, r.data[r.pos:])
+		r.pos += n
+		return n, nil
+	}
+	return 0, r.err
+}
+
+// TestRecordChannelSuccessTreatsBrokenSSEStreamAsFailure 验证 SSE 流半路断掉的渠道
+// 在熔断器里按失败记账，而客户端取消导致的断流不惩罚渠道。
+func TestRecordChannelSuccessTreatsBrokenSSEStreamAsFailure(t *testing.T) {
+	runOnce := func(t *testing.T, streamErr error) *Proxy {
+		t.Helper()
+		channels := []Channel{
+			{
+				Id:      1,
+				Name:    "sse",
+				BaseURL: "https://sse.example.com",
+				Enabled: true,
+				GetKeys: func(ctx *Context) []Key {
+					return []Key{{ID: "k", Value: "v"}}
+				},
+				Handler: func(ctx *Context) (*http.Response, error) {
+					header := make(http.Header)
+					header.Set("Content-Type", "text/event-stream")
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     header,
+						Body: io.NopCloser(&errorAfterReader{
+							data: []byte("event: message_start\ndata: {}\n\n"),
+							err:  streamErr,
+						}),
+					}, nil
+				},
+			},
+		}
+
+		p := New(Config{
+			Retry: NoRetry(),
+			CircuitBreaker: CircuitBreakerConfig{
+				Enabled:            true,
+				MinSamples:         1,
+				ErrorRateThreshold: 1,
+				FailureWindow:      time.Minute,
+				Cooldown:           time.Minute,
+			},
+		})
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+		ctx := &Context{Request: req}
+		result := p.tryChannels(req, ctx, channels, NoRetry())
+		if result.successResp == nil {
+			t.Fatalf("request should succeed at the HTTP level")
+		}
+		p.writePipelineResponse(httptest.NewRecorder(), req, ctx, result)
+		return p
+	}
+
+	t.Run("upstream read error opens circuit", func(t *testing.T) {
+		p := runOnce(t, errors.New("unexpected EOF"))
+		if allowed, _, _ := p.breaker.Allow(&Channel{Id: 1, Name: "sse"}); allowed {
+			t.Fatalf("broken upstream stream should count as failure and open the circuit")
+		}
+		// 断流失败发生在 HTTP 200 之后：快照不应把 200 记成最后一次失败状态码
+		snapshots := p.breaker.Snapshot()
+		if len(snapshots) != 1 {
+			t.Fatalf("snapshot len=%d, want=1", len(snapshots))
+		}
+		if got := snapshots[0].LastFailureStatusCode; got != 0 {
+			t.Fatalf("LastFailureStatusCode=%d, want=0 for stream interruption", got)
+		}
+	})
+
+	t.Run("client cancel does not punish channel", func(t *testing.T) {
+		p := runOnce(t, context.Canceled)
+		if allowed, _, _ := p.breaker.Allow(&Channel{Id: 1, Name: "sse"}); !allowed {
+			t.Fatalf("client-cancel stream interruption should not open the circuit")
+		}
+	})
+}
+
+// TestServeHTTPReportsStreamInterruptionToOnRequestDone 验证上游断流时
+// Observer.OnRequestDone 与熔断决策看到同一结论，而不是 doneErr=nil。
+func TestServeHTTPReportsStreamInterruptionToOnRequestDone(t *testing.T) {
+	obs := &captureDoneObserver{}
+	p := New(Config{
+		Observer: obs,
+		Retry:    NoRetry(),
+		Channels: []Channel{
+			{
+				Id:      1,
+				Name:    "sse",
+				BaseURL: "https://sse.example.com",
+				Enabled: true,
+				GetKeys: func(ctx *Context) []Key {
+					return []Key{{ID: "k", Value: "v"}}
+				},
+				Handler: func(ctx *Context) (*http.Response, error) {
+					header := make(http.Header)
+					header.Set("Content-Type", "text/event-stream")
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     header,
+						Body: io.NopCloser(&errorAfterReader{
+							data: []byte("event: message_start\ndata: {}\n\n"),
+							err:  errors.New("unexpected EOF"),
+						}),
+					}, nil
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	if !obs.called {
+		t.Fatal("OnRequestDone should be called")
+	}
+	if obs.doneErr == nil {
+		t.Fatal("OnRequestDone should receive the stream interruption error")
+	}
+	if !strings.Contains(obs.doneErr.Error(), "upstream stream interrupted") {
+		t.Fatalf("doneErr=%q, want stream interruption error", obs.doneErr)
+	}
+}
+
+// TestNewDefaultsLowerWindowSamplesForRedisStore 验证 Redis store 下 MaxWindowSamples
+// 默认取更小值（每次记账需全量序列化事件列表）。
+func TestNewDefaultsLowerWindowSamplesForRedisStore(t *testing.T) {
+	redisStore := NewRedisCircuitBreakerStore(nil, RedisCircuitBreakerStoreOptions{})
+	p := New(Config{
+		CircuitBreaker:      CircuitBreakerConfig{Enabled: true},
+		CircuitBreakerStore: redisStore,
+	})
+	if got := p.breaker.cfg.MaxWindowSamples; got != 256 {
+		t.Fatalf("redis store MaxWindowSamples=%d, want=256", got)
+	}
+
+	memProxy := New(Config{
+		CircuitBreaker: CircuitBreakerConfig{Enabled: true},
+	})
+	if got := memProxy.breaker.cfg.MaxWindowSamples; got != 2048 {
+		t.Fatalf("memory store MaxWindowSamples=%d, want=2048", got)
+	}
+
+	// 显式配置不被覆盖
+	custom := New(Config{
+		CircuitBreaker:      CircuitBreakerConfig{Enabled: true, MaxWindowSamples: 100},
+		CircuitBreakerStore: redisStore,
+	})
+	if got := custom.breaker.cfg.MaxWindowSamples; got != 100 {
+		t.Fatalf("explicit MaxWindowSamples=%d, want=100", got)
+	}
+}
+
+// TestChannelCircuitBreakerCooldownCappedByMaxCooldown 验证连续熔断的指数冷却会被 MaxCooldown 封顶。
+func TestChannelCircuitBreakerCooldownCappedByMaxCooldown(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	breaker := newChannelCircuitBreaker("cooldown-cap", CircuitBreakerConfig{
+		Enabled:            true,
+		MinSamples:         1,
+		ErrorRateThreshold: 1,
+		FailureWindow:      time.Minute,
+		Cooldown:           10 * time.Second,
+		MaxCooldown:        25 * time.Second,
+	})
+	breaker.now = func() time.Time { return now }
+
+	ch := &Channel{Id: 1, Name: "bad"}
+
+	wants := []time.Duration{
+		10 * time.Second, // 第一次打开
+		20 * time.Second, // 翻倍
+		25 * time.Second, // 封顶
+		25 * time.Second, // 保持封顶
+	}
+	for i, want := range wants {
+		_, _, wait, _ := breaker.RecordFailure(ch, 0, false, http.StatusBadGateway)
+		if wait != want {
+			t.Fatalf("open %d: wait=%s, want=%s", i+1, wait, want)
+		}
+		// 等冷却结束，进入半开后再次失败触发下一轮
+		now = now.Add(wait + time.Second)
+		if allowed, _, probe := breaker.Allow(ch); !allowed || !probe {
+			t.Fatalf("open %d: probe should be granted after cooldown", i+1)
+		}
+	}
+}
+
 // TestChannelCircuitBreakerAbandonedProbeReleasedAfterDeadline 验证半开探测被"放弃"
 // （既没有记成功也没有记失败，例如钩子 panic）时，超过 ProbeTimeout 后
 // 后续请求可以重新发起探测，渠道不会永久卡在半开状态。

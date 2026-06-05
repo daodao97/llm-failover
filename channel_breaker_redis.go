@@ -14,6 +14,11 @@ import (
 )
 
 const (
+	// defaultRedisCircuitBreakerMaxWindowSamples 是 Redis store 下 MaxWindowSamples 的默认值。
+	// Redis store 每次记账都要全量 JSON 编解码事件列表并 SET，
+	// 默认 2048 条在饱和时单次写入超过 100KB，因此取更小的默认值。
+	defaultRedisCircuitBreakerMaxWindowSamples = 256
+
 	defaultRedisCircuitBreakerPrefix          = "llm-failover:circuit"
 	defaultRedisCircuitBreakerLockTTL         = 2 * time.Second
 	defaultRedisCircuitBreakerLockWait        = 100 * time.Millisecond

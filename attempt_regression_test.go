@@ -31,8 +31,8 @@ func TestTryChannelDoesNotForwardSensitiveClientHeaders(t *testing.T) {
 	req.Header.Set("X-Trace-Id", "trace-1")
 
 	ctx := &Context{Request: req}
-	if !p.prepareRequestBody(httptest.NewRecorder(), ctx) {
-		t.Fatal("prepareRequestBody should succeed")
+	if err := p.prepareRequestBody(httptest.NewRecorder(), ctx); err != nil {
+		t.Fatalf("prepareRequestBody should succeed: %v", err)
 	}
 
 	resp, err := p.tryChannel(req, ctx, &Channel{
