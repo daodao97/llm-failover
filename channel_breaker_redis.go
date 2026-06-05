@@ -47,17 +47,18 @@ type redisChannelCircuitEvent struct {
 }
 
 type redisChannelCircuitState struct {
-	Events             []redisChannelCircuitEvent `json:"events"`
-	OpenUntil          time.Time                  `json:"open_until,omitempty"`
-	HalfOpen           bool                       `json:"half_open,omitempty"`
-	UpdatedAt          time.Time                  `json:"updated_at,omitempty"`
-	ChannelID          int                        `json:"channel_id,omitempty"`
-	Name               string                     `json:"name,omitempty"`
-	OpenReason         string                     `json:"open_reason,omitempty"`
-	LastFailureStatus  int                        `json:"last_failure_status,omitempty"`
-	LastLatencyNanos   int64                      `json:"last_latency_nanos,omitempty"`
-	CurrentCooldown    int64                      `json:"current_cooldown_nanos,omitempty"`
-	ConsecutiveOpenCnt int                        `json:"consecutive_open_count,omitempty"`
+	Events                    []redisChannelCircuitEvent `json:"events"`
+	OpenUntil                 time.Time                  `json:"open_until,omitempty"`
+	HalfOpen                  bool                       `json:"half_open,omitempty"`
+	UpdatedAt                 time.Time                  `json:"updated_at,omitempty"`
+	ChannelID                 int                        `json:"channel_id,omitempty"`
+	Name                      string                     `json:"name,omitempty"`
+	OpenReason                string                     `json:"open_reason,omitempty"`
+	LastFailureStatus         int                        `json:"last_failure_status,omitempty"`
+	LastLatencyNanos          int64                      `json:"last_latency_nanos,omitempty"`
+	CurrentCooldown           int64                      `json:"current_cooldown_nanos,omitempty"`
+	ConsecutiveOpenCnt        int                        `json:"consecutive_open_count,omitempty"`
+	CircuitBreakerWhitelisted bool                       `json:"circuit_breaker_whitelisted,omitempty"`
 }
 
 func NewRedisCircuitBreakerStore(client redis.UniversalClient, opts RedisCircuitBreakerStoreOptions) *RedisCircuitBreakerStore {
@@ -262,16 +263,17 @@ func redisCircuitBreakerLockToken() (string, error) {
 
 func encodeRedisChannelCircuitState(state *channelCircuitState) ([]byte, error) {
 	redisState := redisChannelCircuitState{
-		OpenUntil:          state.openUntil,
-		HalfOpen:           state.halfOpen,
-		UpdatedAt:          state.updatedAt,
-		ChannelID:          state.channelID,
-		Name:               state.name,
-		OpenReason:         state.openReason,
-		LastFailureStatus:  state.lastFailureStatus,
-		LastLatencyNanos:   int64(state.lastLatency),
-		CurrentCooldown:    int64(state.currentCooldown),
-		ConsecutiveOpenCnt: state.consecutiveOpenCnt,
+		OpenUntil:                 state.openUntil,
+		HalfOpen:                  state.halfOpen,
+		UpdatedAt:                 state.updatedAt,
+		ChannelID:                 state.channelID,
+		Name:                      state.name,
+		OpenReason:                state.openReason,
+		LastFailureStatus:         state.lastFailureStatus,
+		LastLatencyNanos:          int64(state.lastLatency),
+		CurrentCooldown:           int64(state.currentCooldown),
+		ConsecutiveOpenCnt:        state.consecutiveOpenCnt,
+		CircuitBreakerWhitelisted: state.circuitBreakerWhitelisted,
 	}
 	if len(state.events) > 0 {
 		redisState.Events = make([]redisChannelCircuitEvent, 0, len(state.events))
@@ -295,16 +297,17 @@ func decodeRedisChannelCircuitState(raw []byte) (*channelCircuitState, error) {
 	}
 
 	state := &channelCircuitState{
-		openUntil:          redisState.OpenUntil,
-		halfOpen:           redisState.HalfOpen,
-		updatedAt:          redisState.UpdatedAt,
-		channelID:          redisState.ChannelID,
-		name:               redisState.Name,
-		openReason:         redisState.OpenReason,
-		lastFailureStatus:  redisState.LastFailureStatus,
-		lastLatency:        time.Duration(redisState.LastLatencyNanos),
-		currentCooldown:    time.Duration(redisState.CurrentCooldown),
-		consecutiveOpenCnt: redisState.ConsecutiveOpenCnt,
+		openUntil:                 redisState.OpenUntil,
+		halfOpen:                  redisState.HalfOpen,
+		updatedAt:                 redisState.UpdatedAt,
+		channelID:                 redisState.ChannelID,
+		name:                      redisState.Name,
+		openReason:                redisState.OpenReason,
+		lastFailureStatus:         redisState.LastFailureStatus,
+		lastLatency:               time.Duration(redisState.LastLatencyNanos),
+		currentCooldown:           time.Duration(redisState.CurrentCooldown),
+		consecutiveOpenCnt:        redisState.ConsecutiveOpenCnt,
+		circuitBreakerWhitelisted: redisState.CircuitBreakerWhitelisted,
 	}
 	if len(redisState.Events) > 0 {
 		state.events = make([]channelCircuitEvent, 0, len(redisState.Events))

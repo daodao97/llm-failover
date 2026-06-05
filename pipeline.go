@@ -84,8 +84,10 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 		}
 
 		probeMode := false
-		if p.breaker != nil && !p.isCircuitBreakerWhitelisted(&channels[i]) {
-			if allowed, wait, probe := p.breaker.Allow(&channels[i]); !allowed {
+		if p.breaker != nil {
+			if p.isCircuitBreakerWhitelisted(&channels[i]) {
+				p.breaker.TrackChannel(&channels[i], true)
+			} else if allowed, wait, probe := p.breaker.Allow(&channels[i]); !allowed {
 				channelName := MaskChannelName(strconv.Itoa(channels[i].Id))
 				if result.lastErr == nil {
 					result.lastErr = fmt.Errorf("channel circuit open: [%s] %s", channelName, "CC")
@@ -172,14 +174,18 @@ func (p *Proxy) recordCircuitFailure(r *http.Request, ctx *Context, ch *Channel,
 	if p == nil || p.breaker == nil || ctx == nil || ch == nil || err == nil {
 		return false
 	}
+	latency, stream := circuitObservation(ctx)
 	if p.isCircuitBreakerWhitelisted(ch) {
+		if IsContextDoneError(err) {
+			return false
+		}
+		p.breaker.RecordWhitelistedFailure(ch, latency, stream, ctx.LastStatusCode)
 		return false
 	}
 	if IsContextDoneError(err) || !p.shouldCountChannelFailureForCircuit(ctx, ch, err) {
 		return false
 	}
 
-	latency, stream := circuitObservation(ctx)
 	opened, reopen, wait, reason := p.breaker.RecordFailure(ch, latency, stream, ctx.LastStatusCode)
 	if !opened {
 		return false
@@ -315,11 +321,12 @@ func (p *Proxy) recordChannelSuccess(r *http.Request, ctx *Context) {
 	if p == nil || p.breaker == nil || ctx == nil || ctx.Channel == nil {
 		return
 	}
+	latency, stream := circuitObservation(ctx)
 	if p.isCircuitBreakerWhitelisted(ctx.Channel) {
+		p.breaker.RecordWhitelistedSuccess(ctx.Channel, latency, stream)
 		return
 	}
 
-	latency, stream := circuitObservation(ctx)
 	if opened, wait, reason := p.breaker.RecordSuccess(ctx.Channel, latency, stream); opened {
 		p.observer().OnCircuitStateChange(ctx, ctx.Channel, "closed", "open", reason)
 		p.logger().WarnCtx(r.Context(), "channel circuit opened",

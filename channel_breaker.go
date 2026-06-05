@@ -17,54 +17,55 @@ const (
 )
 
 type ChannelHealthSnapshot struct {
-	Scope                    string    `json:"scope"`
-	ChannelKey               string    `json:"channel_key"`
-	ChannelID                int       `json:"channel_id"`
-	ChannelName              string    `json:"channel_name"`
-	Status                   string    `json:"status"`
-	OpenReason               string    `json:"open_reason"`
-	LastFailureStatusCode    int       `json:"last_failure_status_code"`
-	RequestCount             int       `json:"request_count"`
-	SuccessCount             int       `json:"success_count"`
-	FailureCount             int       `json:"failure_count"`
-	SlowCount                int       `json:"slow_count"`
-	StreamRequestCount       int       `json:"stream_request_count"`
-	StreamSuccessCount       int       `json:"stream_success_count"`
-	StreamFailureCount       int       `json:"stream_failure_count"`
-	StreamSlowCount          int       `json:"stream_slow_count"`
-	NonStreamRequestCount    int       `json:"non_stream_request_count"`
-	NonStreamSuccessCount    int       `json:"non_stream_success_count"`
-	NonStreamFailureCount    int       `json:"non_stream_failure_count"`
-	NonStreamSlowCount       int       `json:"non_stream_slow_count"`
-	MinSamples               int       `json:"min_samples"`
-	ErrorRate                float64   `json:"error_rate"`
-	ErrorRateThreshold       float64   `json:"error_rate_threshold"`
-	SlowRate                 float64   `json:"slow_rate"`
-	SlowRateThreshold        float64   `json:"slow_rate_threshold"`
-	FailureWindowSec         int64     `json:"failure_window_sec"`
-	CooldownSec              int64     `json:"cooldown_sec"`
-	OpenRemainingSec         int64     `json:"open_remaining_sec"`
-	ConsecutiveOpenCount     int       `json:"consecutive_open_count"`
-	AvgLatencyMs             int64     `json:"avg_latency_ms"`
-	P95LatencyMs             int64     `json:"p95_latency_ms"`
-	MaxLatencyMs             int64     `json:"max_latency_ms"`
-	StreamAvgLatencyMs       int64     `json:"stream_avg_latency_ms"`
-	StreamP95LatencyMs       int64     `json:"stream_p95_latency_ms"`
-	StreamMaxLatencyMs       int64     `json:"stream_max_latency_ms"`
-	NonStreamAvgLatencyMs    int64     `json:"non_stream_avg_latency_ms"`
-	NonStreamP95LatencyMs    int64     `json:"non_stream_p95_latency_ms"`
-	NonStreamMaxLatencyMs    int64     `json:"non_stream_max_latency_ms"`
-	LastLatencyMs            int64     `json:"last_latency_ms"`
-	LastSuccessLatencyMs     int64     `json:"last_success_latency_ms"`
-	LastFailureLatencyMs     int64     `json:"last_failure_latency_ms"`
-	SlowThresholdMs          int64     `json:"slow_threshold_ms"`
-	LastLatencyMode          string    `json:"last_latency_mode"`
-	StreamSlowThresholdMs    int64     `json:"stream_slow_threshold_ms"`
-	NonStreamSlowThresholdMs int64     `json:"non_stream_slow_threshold_ms"`
-	LastSuccessAt            time.Time `json:"last_success_at,omitempty"`
-	LastFailureAt            time.Time `json:"last_failure_at,omitempty"`
-	OpenUntil                time.Time `json:"open_until,omitempty"`
-	UpdatedAt                time.Time `json:"updated_at,omitempty"`
+	Scope                     string    `json:"scope"`
+	ChannelKey                string    `json:"channel_key"`
+	ChannelID                 int       `json:"channel_id"`
+	ChannelName               string    `json:"channel_name"`
+	CircuitBreakerWhitelisted bool      `json:"circuit_breaker_whitelisted"`
+	Status                    string    `json:"status"`
+	OpenReason                string    `json:"open_reason"`
+	LastFailureStatusCode     int       `json:"last_failure_status_code"`
+	RequestCount              int       `json:"request_count"`
+	SuccessCount              int       `json:"success_count"`
+	FailureCount              int       `json:"failure_count"`
+	SlowCount                 int       `json:"slow_count"`
+	StreamRequestCount        int       `json:"stream_request_count"`
+	StreamSuccessCount        int       `json:"stream_success_count"`
+	StreamFailureCount        int       `json:"stream_failure_count"`
+	StreamSlowCount           int       `json:"stream_slow_count"`
+	NonStreamRequestCount     int       `json:"non_stream_request_count"`
+	NonStreamSuccessCount     int       `json:"non_stream_success_count"`
+	NonStreamFailureCount     int       `json:"non_stream_failure_count"`
+	NonStreamSlowCount        int       `json:"non_stream_slow_count"`
+	MinSamples                int       `json:"min_samples"`
+	ErrorRate                 float64   `json:"error_rate"`
+	ErrorRateThreshold        float64   `json:"error_rate_threshold"`
+	SlowRate                  float64   `json:"slow_rate"`
+	SlowRateThreshold         float64   `json:"slow_rate_threshold"`
+	FailureWindowSec          int64     `json:"failure_window_sec"`
+	CooldownSec               int64     `json:"cooldown_sec"`
+	OpenRemainingSec          int64     `json:"open_remaining_sec"`
+	ConsecutiveOpenCount      int       `json:"consecutive_open_count"`
+	AvgLatencyMs              int64     `json:"avg_latency_ms"`
+	P95LatencyMs              int64     `json:"p95_latency_ms"`
+	MaxLatencyMs              int64     `json:"max_latency_ms"`
+	StreamAvgLatencyMs        int64     `json:"stream_avg_latency_ms"`
+	StreamP95LatencyMs        int64     `json:"stream_p95_latency_ms"`
+	StreamMaxLatencyMs        int64     `json:"stream_max_latency_ms"`
+	NonStreamAvgLatencyMs     int64     `json:"non_stream_avg_latency_ms"`
+	NonStreamP95LatencyMs     int64     `json:"non_stream_p95_latency_ms"`
+	NonStreamMaxLatencyMs     int64     `json:"non_stream_max_latency_ms"`
+	LastLatencyMs             int64     `json:"last_latency_ms"`
+	LastSuccessLatencyMs      int64     `json:"last_success_latency_ms"`
+	LastFailureLatencyMs      int64     `json:"last_failure_latency_ms"`
+	SlowThresholdMs           int64     `json:"slow_threshold_ms"`
+	LastLatencyMode           string    `json:"last_latency_mode"`
+	StreamSlowThresholdMs     int64     `json:"stream_slow_threshold_ms"`
+	NonStreamSlowThresholdMs  int64     `json:"non_stream_slow_threshold_ms"`
+	LastSuccessAt             time.Time `json:"last_success_at,omitempty"`
+	LastFailureAt             time.Time `json:"last_failure_at,omitempty"`
+	OpenUntil                 time.Time `json:"open_until,omitempty"`
+	UpdatedAt                 time.Time `json:"updated_at,omitempty"`
 }
 
 type channelCircuitEvent struct {
@@ -76,17 +77,18 @@ type channelCircuitEvent struct {
 }
 
 type channelCircuitState struct {
-	events             []channelCircuitEvent
-	openUntil          time.Time
-	halfOpen           bool
-	updatedAt          time.Time
-	channelID          int
-	name               string
-	openReason         string
-	lastFailureStatus  int
-	lastLatency        time.Duration
-	currentCooldown    time.Duration
-	consecutiveOpenCnt int
+	events                    []channelCircuitEvent
+	openUntil                 time.Time
+	halfOpen                  bool
+	updatedAt                 time.Time
+	channelID                 int
+	name                      string
+	openReason                string
+	lastFailureStatus         int
+	lastLatency               time.Duration
+	currentCooldown           time.Duration
+	consecutiveOpenCnt        int
+	circuitBreakerWhitelisted bool
 }
 
 type channelCircuitStoreEntry struct {
@@ -318,6 +320,20 @@ func (b *channelCircuitBreaker) Allow(ch *Channel) (bool, time.Duration, bool) {
 	return allowed, wait, probe
 }
 
+func (b *channelCircuitBreaker) TrackChannel(ch *Channel, circuitBreakerWhitelisted bool) {
+	if b == nil || b.store == nil || ch == nil {
+		return
+	}
+
+	now := b.now()
+	_ = b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+		updateChannelCircuitStateMetadata(state, ch)
+		state.circuitBreakerWhitelisted = circuitBreakerWhitelisted
+		state.updatedAt = now
+		return false, b.stateTTL(state, now)
+	})
+}
+
 func (b *channelCircuitBreaker) RecordSuccess(ch *Channel, latency time.Duration, stream bool) (opened bool, wait time.Duration, reason string) {
 	if b == nil || b.store == nil || ch == nil {
 		return false, 0, ""
@@ -326,6 +342,7 @@ func (b *channelCircuitBreaker) RecordSuccess(ch *Channel, latency time.Duration
 	now := b.now()
 	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		updateChannelCircuitStateMetadata(state, ch)
+		state.circuitBreakerWhitelisted = false
 		event := channelCircuitEvent{
 			at:      now,
 			success: true,
@@ -375,6 +392,33 @@ func (b *channelCircuitBreaker) RecordSuccess(ch *Channel, latency time.Duration
 	return opened, wait, reason
 }
 
+func (b *channelCircuitBreaker) RecordWhitelistedSuccess(ch *Channel, latency time.Duration, stream bool) {
+	if b == nil || b.store == nil || ch == nil {
+		return
+	}
+
+	now := b.now()
+	_ = b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+		updateChannelCircuitStateMetadata(state, ch)
+		state.circuitBreakerWhitelisted = true
+		state.events = append(trimEvents(state.events, now, b.cfg.FailureWindow), channelCircuitEvent{
+			at:      now,
+			success: true,
+			latency: latency,
+			slow:    isSlowEvent(latency, stream, b.cfg),
+			stream:  stream,
+		})
+		state.updatedAt = now
+		state.lastLatency = latency
+		state.openUntil = time.Time{}
+		state.halfOpen = false
+		state.openReason = ""
+		state.currentCooldown = 0
+		state.consecutiveOpenCnt = 0
+		return false, b.stateTTL(state, now)
+	})
+}
+
 func (b *channelCircuitBreaker) RecordFailure(ch *Channel, latency time.Duration, stream bool, statusCode int) (opened bool, reopen bool, wait time.Duration, reason string) {
 	if b == nil || b.store == nil || ch == nil {
 		return false, false, 0, ""
@@ -383,6 +427,7 @@ func (b *channelCircuitBreaker) RecordFailure(ch *Channel, latency time.Duration
 	now := b.now()
 	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		updateChannelCircuitStateMetadata(state, ch)
+		state.circuitBreakerWhitelisted = false
 		event := channelCircuitEvent{
 			at:      now,
 			success: false,
@@ -425,6 +470,34 @@ func (b *channelCircuitBreaker) RecordFailure(ch *Channel, latency time.Duration
 	return opened, reopen, wait, reason
 }
 
+func (b *channelCircuitBreaker) RecordWhitelistedFailure(ch *Channel, latency time.Duration, stream bool, statusCode int) {
+	if b == nil || b.store == nil || ch == nil {
+		return
+	}
+
+	now := b.now()
+	_ = b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+		updateChannelCircuitStateMetadata(state, ch)
+		state.circuitBreakerWhitelisted = true
+		state.events = append(trimEvents(state.events, now, b.cfg.FailureWindow), channelCircuitEvent{
+			at:      now,
+			success: false,
+			latency: latency,
+			slow:    isSlowEvent(latency, stream, b.cfg),
+			stream:  stream,
+		})
+		state.updatedAt = now
+		state.lastLatency = latency
+		state.lastFailureStatus = statusCode
+		state.openUntil = time.Time{}
+		state.halfOpen = false
+		state.openReason = ""
+		state.currentCooldown = 0
+		state.consecutiveOpenCnt = 0
+		return false, b.stateTTL(state, now)
+	})
+}
+
 func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
 	if b == nil || b.store == nil {
 		return nil
@@ -441,8 +514,10 @@ func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
 		state := entry.state
 		state.events = trimEvents(state.events, now, b.cfg.FailureWindow)
 		if len(state.events) == 0 && !state.openUntil.After(now) && !state.halfOpen {
-			_, _ = b.store.resetChannelByKey(b.scope, key)
-			continue
+			if !state.circuitBreakerWhitelisted {
+				_, _ = b.store.resetChannelByKey(b.scope, key)
+				continue
+			}
 		}
 		summary := summarizeEvents(state.events)
 		errorRate := 0.0
@@ -478,54 +553,55 @@ func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
 		}
 
 		snapshots = append(snapshots, ChannelHealthSnapshot{
-			Scope:                    b.scope,
-			ChannelKey:               key,
-			ChannelID:                state.channelID,
-			ChannelName:              state.name,
-			Status:                   status,
-			OpenReason:               state.openReason,
-			LastFailureStatusCode:    state.lastFailureStatus,
-			RequestCount:             summary.RequestCount,
-			SuccessCount:             summary.SuccessCount,
-			FailureCount:             summary.FailureCount,
-			SlowCount:                summary.SlowCount,
-			StreamRequestCount:       summary.StreamRequestCount,
-			StreamSuccessCount:       summary.StreamSuccessCount,
-			StreamFailureCount:       summary.StreamFailureCount,
-			StreamSlowCount:          summary.StreamSlowCount,
-			NonStreamRequestCount:    summary.NonStreamRequestCount,
-			NonStreamSuccessCount:    summary.NonStreamSuccessCount,
-			NonStreamFailureCount:    summary.NonStreamFailureCount,
-			NonStreamSlowCount:       summary.NonStreamSlowCount,
-			MinSamples:               b.cfg.MinSamples,
-			ErrorRate:                errorRate,
-			ErrorRateThreshold:       b.cfg.ErrorRateThreshold,
-			SlowRate:                 slowRate,
-			SlowRateThreshold:        b.cfg.SlowRateThreshold,
-			FailureWindowSec:         int64(b.cfg.FailureWindow / time.Second),
-			CooldownSec:              int64(state.cooldownForDisplay(b.cfg.Cooldown) / time.Second),
-			OpenRemainingSec:         openRemainingSec,
-			ConsecutiveOpenCount:     state.consecutiveOpenCnt,
-			AvgLatencyMs:             avgLatencyMs,
-			P95LatencyMs:             latencyPercentileMs(summary.Latencies, 0.95),
-			MaxLatencyMs:             summary.MaxLatency.Milliseconds(),
-			StreamAvgLatencyMs:       streamAvgLatencyMs,
-			StreamP95LatencyMs:       latencyPercentileMs(summary.StreamLatencies, 0.95),
-			StreamMaxLatencyMs:       summary.StreamMaxLatency.Milliseconds(),
-			NonStreamAvgLatencyMs:    nonStreamAvgLatencyMs,
-			NonStreamP95LatencyMs:    latencyPercentileMs(summary.NonStreamLatencies, 0.95),
-			NonStreamMaxLatencyMs:    summary.NonStreamMaxLatency.Milliseconds(),
-			LastLatencyMs:            summary.LastLatency.Milliseconds(),
-			LastSuccessLatencyMs:     summary.LastSuccessLatency.Milliseconds(),
-			LastFailureLatencyMs:     summary.LastFailureLatency.Milliseconds(),
-			SlowThresholdMs:          selectedSlowThreshold(summary.LastLatencyMode == "stream", b.cfg).Milliseconds(),
-			LastLatencyMode:          summary.LastLatencyMode,
-			StreamSlowThresholdMs:    effectiveStreamSlowThreshold(b.cfg).Milliseconds(),
-			NonStreamSlowThresholdMs: effectiveNonStreamSlowThreshold(b.cfg).Milliseconds(),
-			LastSuccessAt:            summary.LastSuccessAt,
-			LastFailureAt:            summary.LastFailureAt,
-			OpenUntil:                state.openUntil,
-			UpdatedAt:                state.updatedAt,
+			Scope:                     b.scope,
+			ChannelKey:                key,
+			ChannelID:                 state.channelID,
+			ChannelName:               state.name,
+			CircuitBreakerWhitelisted: state.circuitBreakerWhitelisted,
+			Status:                    status,
+			OpenReason:                state.openReason,
+			LastFailureStatusCode:     state.lastFailureStatus,
+			RequestCount:              summary.RequestCount,
+			SuccessCount:              summary.SuccessCount,
+			FailureCount:              summary.FailureCount,
+			SlowCount:                 summary.SlowCount,
+			StreamRequestCount:        summary.StreamRequestCount,
+			StreamSuccessCount:        summary.StreamSuccessCount,
+			StreamFailureCount:        summary.StreamFailureCount,
+			StreamSlowCount:           summary.StreamSlowCount,
+			NonStreamRequestCount:     summary.NonStreamRequestCount,
+			NonStreamSuccessCount:     summary.NonStreamSuccessCount,
+			NonStreamFailureCount:     summary.NonStreamFailureCount,
+			NonStreamSlowCount:        summary.NonStreamSlowCount,
+			MinSamples:                b.cfg.MinSamples,
+			ErrorRate:                 errorRate,
+			ErrorRateThreshold:        b.cfg.ErrorRateThreshold,
+			SlowRate:                  slowRate,
+			SlowRateThreshold:         b.cfg.SlowRateThreshold,
+			FailureWindowSec:          int64(b.cfg.FailureWindow / time.Second),
+			CooldownSec:               int64(state.cooldownForDisplay(b.cfg.Cooldown) / time.Second),
+			OpenRemainingSec:          openRemainingSec,
+			ConsecutiveOpenCount:      state.consecutiveOpenCnt,
+			AvgLatencyMs:              avgLatencyMs,
+			P95LatencyMs:              latencyPercentileMs(summary.Latencies, 0.95),
+			MaxLatencyMs:              summary.MaxLatency.Milliseconds(),
+			StreamAvgLatencyMs:        streamAvgLatencyMs,
+			StreamP95LatencyMs:        latencyPercentileMs(summary.StreamLatencies, 0.95),
+			StreamMaxLatencyMs:        summary.StreamMaxLatency.Milliseconds(),
+			NonStreamAvgLatencyMs:     nonStreamAvgLatencyMs,
+			NonStreamP95LatencyMs:     latencyPercentileMs(summary.NonStreamLatencies, 0.95),
+			NonStreamMaxLatencyMs:     summary.NonStreamMaxLatency.Milliseconds(),
+			LastLatencyMs:             summary.LastLatency.Milliseconds(),
+			LastSuccessLatencyMs:      summary.LastSuccessLatency.Milliseconds(),
+			LastFailureLatencyMs:      summary.LastFailureLatency.Milliseconds(),
+			SlowThresholdMs:           selectedSlowThreshold(summary.LastLatencyMode == "stream", b.cfg).Milliseconds(),
+			LastLatencyMode:           summary.LastLatencyMode,
+			StreamSlowThresholdMs:     effectiveStreamSlowThreshold(b.cfg).Milliseconds(),
+			NonStreamSlowThresholdMs:  effectiveNonStreamSlowThreshold(b.cfg).Milliseconds(),
+			LastSuccessAt:             summary.LastSuccessAt,
+			LastFailureAt:             summary.LastFailureAt,
+			OpenUntil:                 state.openUntil,
+			UpdatedAt:                 state.updatedAt,
 		})
 	}
 

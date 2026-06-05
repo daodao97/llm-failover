@@ -139,7 +139,7 @@ func TestTryChannelsCircuitBreakerWhitelistByName(t *testing.T) {
 			FailureWindow:      time.Second,
 			Cooldown:           time.Minute,
 		},
-		CircuitBreakerWhitelist: []string{"bad"},
+		CircuitBreakerWhitelist: []string{"bad", "good"},
 		ShouldCountFailureForCircuit: func(ctx *Context, ch *Channel, err error) bool {
 			return ch != nil && ch.Name == "bad"
 		},
@@ -162,10 +162,53 @@ func TestTryChannelsCircuitBreakerWhitelistByName(t *testing.T) {
 	if goodAttempts != 3 {
 		t.Fatalf("goodAttempts=%d, want=3", goodAttempts)
 	}
+	var badSnapshot *ChannelHealthSnapshot
+	var goodSnapshot *ChannelHealthSnapshot
 	for _, snapshot := range p.breaker.Snapshot() {
 		if snapshot.ChannelName == "bad" {
-			t.Fatalf("whitelisted channel should not be recorded in breaker snapshot: %+v", snapshot)
+			snapshot := snapshot
+			badSnapshot = &snapshot
 		}
+		if snapshot.ChannelName == "good" {
+			snapshot := snapshot
+			goodSnapshot = &snapshot
+		}
+	}
+	if badSnapshot == nil {
+		t.Fatal("whitelisted channel should be recorded in breaker snapshot")
+	}
+	if !badSnapshot.CircuitBreakerWhitelisted {
+		t.Fatalf("circuitBreakerWhitelisted=%v, want=true", badSnapshot.CircuitBreakerWhitelisted)
+	}
+	if badSnapshot.Status != "closed" {
+		t.Fatalf("whitelisted status=%s, want=closed", badSnapshot.Status)
+	}
+	if badSnapshot.RequestCount != 3 {
+		t.Fatalf("whitelisted requestCount=%d, want=3", badSnapshot.RequestCount)
+	}
+	if badSnapshot.SuccessCount != 0 {
+		t.Fatalf("whitelisted successCount=%d, want=0", badSnapshot.SuccessCount)
+	}
+	if badSnapshot.FailureCount != 3 {
+		t.Fatalf("whitelisted failureCount=%d, want=3", badSnapshot.FailureCount)
+	}
+	if goodSnapshot == nil {
+		t.Fatal("successful whitelisted channel should be recorded in breaker snapshot")
+	}
+	if !goodSnapshot.CircuitBreakerWhitelisted {
+		t.Fatalf("good circuitBreakerWhitelisted=%v, want=true", goodSnapshot.CircuitBreakerWhitelisted)
+	}
+	if goodSnapshot.Status != "closed" {
+		t.Fatalf("good status=%s, want=closed", goodSnapshot.Status)
+	}
+	if goodSnapshot.RequestCount != 3 {
+		t.Fatalf("good requestCount=%d, want=3", goodSnapshot.RequestCount)
+	}
+	if goodSnapshot.SuccessCount != 3 {
+		t.Fatalf("good successCount=%d, want=3", goodSnapshot.SuccessCount)
+	}
+	if goodSnapshot.FailureCount != 0 {
+		t.Fatalf("good failureCount=%d, want=0", goodSnapshot.FailureCount)
 	}
 }
 
