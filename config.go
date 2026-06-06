@@ -29,6 +29,11 @@ type Config struct {
 	// 该预算只约束选路、重试和拿到上游响应头之前的阶段，不会在成功响应后主动中断响应体转发。
 	FailoverTimeout time.Duration
 	// AttemptTimeout 限制单次上游 attempt 在拿到响应头前的最长耗时。为空时不限制。
+	// 超时后该 attempt 以 ErrAttemptTimeout 失败：计入熔断记账，并在总预算允许时
+	// 继续轮换下一个 key / 下一个渠道（不会终止整条 failover 链）。
+	// 如果先耗尽 FailoverTimeout 总预算，则仍按 context deadline exceeded 处理。
+	// 注意：非流式 LLM 请求的响应头要等整段生成完才返回，TTFB 可达分钟级，
+	// 配置时需容纳非流式场景，或仅在流式链路上启用。
 	AttemptTimeout time.Duration
 	// MinAttemptTimeout 表示发起下一次 attempt 至少需要保留的剩余总预算。为空时只要求总预算未耗尽。
 	MinAttemptTimeout time.Duration

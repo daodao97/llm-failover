@@ -173,7 +173,7 @@ func TestTryChannelNoKeysAvailableFastFail(t *testing.T) {
 	}
 }
 
-func TestServeHTTPAttemptTimeoutStopsBeforeNextChannel(t *testing.T) {
+func TestServeHTTPAttemptTimeoutFailsOverToNextChannel(t *testing.T) {
 	firstAttempts := 0
 	secondAttempts := 0
 	channels := []Channel{
@@ -213,7 +213,7 @@ func TestServeHTTPAttemptTimeoutStopsBeforeNextChannel(t *testing.T) {
 	p := New(Config{
 		Channels:        channels,
 		Retry:           NoRetry(),
-		FailoverTimeout: 100 * time.Millisecond,
+		FailoverTimeout: 200 * time.Millisecond,
 		AttemptTimeout:  20 * time.Millisecond,
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
@@ -223,17 +223,203 @@ func TestServeHTTPAttemptTimeoutStopsBeforeNextChannel(t *testing.T) {
 	p.ServeHTTP(rec, req)
 	elapsed := time.Since(start)
 
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want=%d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if firstAttempts != 1 {
+		t.Fatalf("firstAttempts=%d, want=1（attempt 超时不应在同 key 上重试）", firstAttempts)
+	}
+	if secondAttempts != 1 {
+		t.Fatalf("secondAttempts=%d, want=1（attempt 超时应切到下一个渠道）", secondAttempts)
+	}
+	if elapsed >= 100*time.Millisecond {
+		t.Fatalf("ServeHTTP should fail over near attempt timeout, elapsed=%s", elapsed)
+	}
+}
+
+func TestServeHTTPAttemptTimeoutSkipsSameKeyRetryAndRotatesKeys(t *testing.T) {
+	attemptsByKey := map[string]int{}
+	channels := []Channel{
+		{
+			Id:      1,
+			Name:    "slow",
+			BaseURL: "https://slow.example.com",
+			Enabled: true,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{
+					{ID: "key-a", Value: "value-a"},
+					{ID: "key-b", Value: "value-b"},
+				}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				attemptsByKey[ctx.CurrentKey.ID]++
+				<-ctx.Request.Context().Done()
+				return nil, ctx.Request.Context().Err()
+			},
+		},
+	}
+
+	retry := DefaultRetry()
+	retry.MaxAttempts = 3
+	p := New(Config{
+		Channels:        channels,
+		Retry:           retry,
+		FailoverTimeout: 300 * time.Millisecond,
+		AttemptTimeout:  20 * time.Millisecond,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Fatalf("status=%d, want=%d body=%s", rec.Code, http.StatusGatewayTimeout, rec.Body.String())
 	}
-	if firstAttempts != 1 {
-		t.Fatalf("firstAttempts=%d, want=1", firstAttempts)
+	// attempt 超时跳过同 key 重试（MaxAttempts=3 不生效），但仍轮换池内每个 key 一次
+	if attemptsByKey["key-a"] != 1 || attemptsByKey["key-b"] != 1 {
+		t.Fatalf("attemptsByKey=%v, want one attempt per key", attemptsByKey)
 	}
-	if secondAttempts != 0 {
-		t.Fatalf("secondAttempts=%d, want=0 after attempt timeout", secondAttempts)
+}
+
+func TestTryChannelsAttemptTimeoutRecordsCircuitFailure(t *testing.T) {
+	slowAttempts := 0
+	goodAttempts := 0
+	channels := []Channel{
+		{
+			Id:      1,
+			Name:    "slow",
+			BaseURL: "https://slow.example.com",
+			Enabled: true,
+			CType:   CTypeThird,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "slow-key", Value: "slow-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				slowAttempts++
+				<-ctx.Request.Context().Done()
+				return nil, ctx.Request.Context().Err()
+			},
+		},
+		{
+			Id:      2,
+			Name:    "good",
+			BaseURL: "https://good.example.com",
+			Enabled: true,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "good-key", Value: "good-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				goodAttempts++
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       http.NoBody,
+				}, nil
+			},
+		},
 	}
-	if elapsed >= 80*time.Millisecond {
-		t.Fatalf("ServeHTTP should return near attempt timeout, elapsed=%s", elapsed)
+
+	p := New(Config{
+		Retry:           NoRetry(),
+		FailoverTimeout: 500 * time.Millisecond,
+		AttemptTimeout:  20 * time.Millisecond,
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         2,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Second,
+			Cooldown:           time.Minute,
+		},
+	})
+
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+		ctx := &Context{Request: req}
+		result := p.tryChannels(req, ctx, channels, NoRetry())
+		if result.successResp == nil {
+			t.Fatalf("request %d should succeed on fallback channel, lastErr=%v", i+1, result.lastErr)
+		}
+		result.successResp.Body.Close()
+	}
+
+	// attempt 超时计入熔断：两次失败后 slow 渠道应被熔断跳过
+	if slowAttempts != 2 {
+		t.Fatalf("slowAttempts=%d, want=2 after circuit opens on attempt timeouts", slowAttempts)
+	}
+	if goodAttempts != 3 {
+		t.Fatalf("goodAttempts=%d, want=3", goodAttempts)
+	}
+}
+
+func TestTryChannelsFailoverTimeoutDoesNotRecordCircuitFailure(t *testing.T) {
+	cases := []struct {
+		name           string
+		attemptTimeout time.Duration
+	}{
+		{name: "attempt timeout unset"},
+		{name: "attempt timeout larger than failover budget", attemptTimeout: 100 * time.Millisecond},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			slowAttempts := 0
+			channels := []Channel{
+				{
+					Id:      1,
+					Name:    "slow",
+					BaseURL: "https://slow.example.com",
+					Enabled: true,
+					CType:   CTypeThird,
+					GetKeys: func(ctx *Context) []Key {
+						return []Key{{ID: "slow-key", Value: "slow-value"}}
+					},
+					Handler: func(ctx *Context) (*http.Response, error) {
+						slowAttempts++
+						<-ctx.Request.Context().Done()
+						return nil, ctx.Request.Context().Err()
+					},
+				},
+			}
+
+			p := New(Config{
+				Retry:           NoRetry(),
+				FailoverTimeout: 20 * time.Millisecond,
+				AttemptTimeout:  tc.attemptTimeout,
+				CircuitBreaker: CircuitBreakerConfig{
+					Enabled:            true,
+					MinSamples:         1,
+					ErrorRateThreshold: 1,
+					FailureWindow:      time.Second,
+					Cooldown:           time.Minute,
+				},
+			})
+
+			for i := 0; i < 2; i++ {
+				req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+				ctx := &Context{Request: req}
+				result := p.tryChannels(req, ctx, channels, NoRetry())
+				if result.successResp != nil {
+					result.successResp.Body.Close()
+					t.Fatalf("request %d should not succeed", i+1)
+				}
+				if result.lastErr == nil {
+					t.Fatalf("request %d expected failover timeout", i+1)
+				}
+				if IsAttemptTimeoutError(result.lastErr) {
+					t.Fatalf("request %d lastErr=%v, want failover timeout not attempt timeout", i+1, result.lastErr)
+				}
+				if !IsContextDeadlineExceededError(result.lastErr) {
+					t.Fatalf("request %d lastErr=%v, want context deadline exceeded", i+1, result.lastErr)
+				}
+			}
+
+			if slowAttempts != 2 {
+				t.Fatalf("slowAttempts=%d, want=2 because failover timeouts must not open circuit", slowAttempts)
+			}
+			if allowed, _, _ := p.breaker.Allow(&channels[0]); !allowed {
+				t.Fatalf("channel should remain allowed after failover timeout")
+			}
+		})
 	}
 }
 

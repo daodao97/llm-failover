@@ -2,7 +2,6 @@ package failover
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"github.com/tidwall/gjson"
@@ -86,10 +85,12 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 
 			resp, err := p.executeSingleAttempt(attemptReq, ctx, ch, &keys[keyIdx])
 			if cleanupAttempt != nil && cleanupAttempt(resp, err) {
+				// 底层错误是 attempt 定时器 cancel() 产生的 context canceled，用 %v 展平，
+				// 避免 context.Canceled 留在错误链里被当成客户端取消而终止整条 failover 链。
 				if err != nil {
-					err = fmt.Errorf("attempt timeout exceeded: %w: %v", context.DeadlineExceeded, err)
+					err = fmt.Errorf("%w: %v", ErrAttemptTimeout, err)
 				} else {
-					err = fmt.Errorf("attempt timeout exceeded: %w", context.DeadlineExceeded)
+					err = fmt.Errorf("%w", ErrAttemptTimeout)
 				}
 			}
 			if err == nil && resp == nil {
@@ -109,6 +110,13 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 					emitAttemptError(err)
 					emitAttemptDone(nil, lastErr, AttemptResultFailed)
 					return nil, wrapChannelError(ch, lastErr)
+				}
+				if IsAttemptTimeoutError(err) {
+					// attempt 超时大概率是渠道侧 TTFB 劣化，同 key 立即重试只会再烧一份预算：
+					// 跳过单 key 重试直接轮换下一个 key，外层预算检查（failoverBudgetError）兜底终止。
+					emitAttemptError(err)
+					emitAttemptDone(nil, err, AttemptResultFailed)
+					break
 				}
 				if p.shouldRetryOnExecutionError(r, ctx, ch, cfg, attempt, err, emitAttemptError) {
 					ctx.LastResponseBody = nil

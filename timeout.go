@@ -2,6 +2,7 @@ package failover
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,17 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// ErrAttemptTimeout 表示单次上游 attempt 在拿到响应头前耗尽了配置的 AttemptTimeout 预算。
+// 若先耗尽的是 FailoverTimeout 总预算，错误仍保持为 context deadline exceeded。
+// 它有别于客户端取消和总预算耗尽：attempt 超时计入熔断失败记账，
+// 且只要总预算仍有剩余，管线会继续轮换同渠道下一个 key 以及后续渠道。
+var ErrAttemptTimeout = errors.New("attempt timeout exceeded")
+
+// IsAttemptTimeoutError 判断错误链中是否包含单次 attempt 超时。
+func IsAttemptTimeoutError(err error) bool {
+	return errors.Is(err, ErrAttemptTimeout)
+}
 
 func (p *Proxy) initFailoverDeadline(ctx *Context) {
 	if p == nil || ctx == nil || p.cfg.FailoverTimeout <= 0 || !ctx.FailoverDeadline.IsZero() {
@@ -42,22 +54,34 @@ func (p *Proxy) failoverBudgetError(ctx *Context) error {
 	return nil
 }
 
-func (p *Proxy) attemptTimeout(ctx *Context) time.Duration {
+type attemptTimeoutSource uint8
+
+const (
+	attemptTimeoutNone attemptTimeoutSource = iota
+	attemptTimeoutAttempt
+	attemptTimeoutFailover
+)
+
+func (p *Proxy) attemptTimeout(ctx *Context) (time.Duration, attemptTimeoutSource) {
 	if p == nil {
-		return 0
+		return 0, attemptTimeoutNone
 	}
 
 	timeout := p.cfg.AttemptTimeout
+	source := attemptTimeoutNone
+	if timeout > 0 {
+		source = attemptTimeoutAttempt
+	}
 	if ctx != nil && !ctx.FailoverDeadline.IsZero() {
 		remaining := time.Until(ctx.FailoverDeadline)
 		if remaining <= 0 {
-			return 0
+			return 0, attemptTimeoutNone
 		}
-		if timeout <= 0 || remaining < timeout {
-			timeout = remaining
+		if timeout <= 0 || remaining <= timeout {
+			return remaining, attemptTimeoutFailover
 		}
 	}
-	return timeout
+	return timeout, source
 }
 
 type attemptRequestCleanup func(resp *http.Response, err error) (attemptTimedOut bool)
@@ -70,9 +94,38 @@ func (p *Proxy) requestForAttempt(r *http.Request, ctx *Context) (*http.Request,
 		return nil, nil, err
 	}
 
-	timeout := p.attemptTimeout(ctx)
+	timeout, timeoutSource := p.attemptTimeout(ctx)
 	if timeout <= 0 {
 		return r, func(*http.Response, error) bool { return false }, nil
+	}
+
+	if timeoutSource == attemptTimeoutFailover {
+		deadline := time.Now().Add(timeout)
+		if ctx != nil && !ctx.FailoverDeadline.IsZero() {
+			deadline = ctx.FailoverDeadline
+		}
+		attemptCtx, cancel := context.WithDeadline(r.Context(), deadline)
+		attemptReq := r.WithContext(attemptCtx)
+		oldReq := (*http.Request)(nil)
+		if ctx != nil {
+			oldReq = ctx.Request
+			ctx.Request = attemptReq
+			ctx.AttemptDeadline = deadline
+		}
+		cleanup := func(resp *http.Response, err error) bool {
+			doneErr := attemptCtx.Err()
+			if ctx != nil {
+				ctx.Request = oldReq
+				ctx.AttemptDeadline = time.Time{}
+			}
+			if resp != nil && err == nil && doneErr == nil {
+				attachCancelOnClose(resp, cancel)
+				return false
+			}
+			cancel()
+			return false
+		}
+		return attemptReq, cleanup, nil
 	}
 
 	attemptCtx, cancel := context.WithCancel(r.Context())

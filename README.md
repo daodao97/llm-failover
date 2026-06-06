@@ -525,6 +525,14 @@ p := failover.New(failover.Config{
 - `MinAttemptTimeout` 用来避免剩余时间太少时继续发起下一次 attempt。
 - 成功拿到上游响应后，预算计时不会主动中断响应体转发，避免误伤 SSE/流式响应。
 
+attempt 超时的语义：超时的 attempt 以 `ErrAttemptTimeout` 失败（可用 `IsAttemptTimeoutError` 判定），
+会计入渠道熔断记账；只要 `FailoverTimeout` 总预算仍有剩余，管线会跳过同 key 重试、
+继续轮换下一个 key 与后续渠道，而不是终止整条链路。只有客户端取消或总预算耗尽才会终止请求。
+如果先耗尽的是 `FailoverTimeout` 总预算，错误仍保持为 `context.DeadlineExceeded`，不会计入渠道熔断。
+
+> ⚠️ 非流式 LLM 请求的响应头要等整段生成完才返回，TTFB 可达分钟级。
+> `AttemptTimeout` 需要容纳非流式场景的完整生成时长，否则长生成的非流式请求会被系统性掐断。
+
 
 ** 🚀 应用方式 **
 

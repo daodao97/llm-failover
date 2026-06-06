@@ -54,7 +54,9 @@ ServeHTTP
 - **两种触发**：错误率（`MinSamples` + `ErrorRateThreshold`）和慢请求率（`SlowThreshold` + `SlowRateThreshold`；流式看 TTFB/FirstEventTime，非流式看 TotalDuration）。
 - **记账区分渠道类型**：`third` 渠道按单次真实上游失败记账（请求内连续 429/5xx 能尽早触发熔断）；`pool` 渠道按整轮 key 池的最终结果记账（一个 key 失败不代表池失败）。
 - **半开探测收紧为单次尝试**：第一次探测失败立刻重新 open，不在同一轮半开里继续重试。
-- 状态存储通过 `CircuitBreakerStore` 接口抽象：默认进程内存，`channel_breaker_redis.go` 提供 Redis 实现（多实例共享，配合 `BreakerScope` 隔离）。
+- **重开退避有上限**：连续熔断时冷却指数退避，但被 `MaxCooldown`（默认 16× `Cooldown`）封顶；窗口事件条数被 `MaxWindowSamples` 封顶（默认 2048，Redis 存储默认 256）。
+- 状态存储通过 `CircuitBreakerStore` 接口抽象：默认进程内存，`channel_breaker_redis.go` 提供 Redis 实现（多实例共享，配合 `BreakerScope` 隔离）。Store 出错时降级为 fail-open 并以 30s 节流记日志。
+- 动态创建/销毁 `Proxy`（如按租户）时需调用 `Proxy.Close()`，从全局健康注册表注销熔断器。
 - `CircuitBreakerWhitelist` 中的渠道不参与熔断（但仍记录健康统计）。
 - `ShouldCountFailureForCircuit` 钩子允许业务自定义哪些失败计入熔断窗口。
 
@@ -62,9 +64,11 @@ ServeHTTP
 
 防止顺序重试把请求拖到上层（如 Cloudflare）超时：`FailoverTimeout` 是整条链路总预算，`AttemptTimeout` 是单次 attempt 拿到响应头前的预算，`MinAttemptTimeout` 避免剩余时间太少时还发起新 attempt。拿到响应头后预算不再中断 body 转发（保护 SSE 长流）。
 
+attempt 超时以 `ErrAttemptTimeout` 哨兵错误标识（`IsAttemptTimeoutError` 判定），与客户端取消/总预算耗尽（`IsContextDoneError`）严格区分：attempt 超时计入熔断记账，并在总预算允许时跳过同 key 重试、继续轮换下一个 key/渠道；只有客户端取消或总预算耗尽才终止整条链路。若先耗尽 `FailoverTimeout` 总预算，错误必须保持为 `context.DeadlineExceeded`，不能包装成 `ErrAttemptTimeout`。包装 attempt 超时时底层 `context.Canceled` 必须用 `%v` 展平，不能让它留在错误链里被 `IsContextDoneError` 误判。
+
 ### SSE 是一等公民
 
-自动识别 `text/event-stream`，支持首包探测（`RetryOnSSE` 可基于首事件决定重试）、`OnSSE` 逐事件观察、`TransformSSE` 事件改写（response.go）。「连接成功但流内容失败」是 LLM 上游的常见故障形态，所以流式与非流式统一纳入重试/熔断治理。
+自动识别 `text/event-stream`，支持首包探测（`RetryOnSSE` 可基于首事件决定重试）、`OnSSE` 逐事件观察、`TransformSSE` 事件改写（response.go）。「连接成功但流内容失败」是 LLM 上游的常见故障形态，所以流式与非流式统一纳入重试/熔断治理：2xx 之后上游断流会记入 `Context.StreamReadErr` 并计为熔断失败（客户端主动取消除外）。
 
 ### 可观测
 

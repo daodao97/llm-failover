@@ -271,6 +271,11 @@ func (p *Proxy) shouldContinueToNextChannel(ctx *Context, ch *Channel, cfg Retry
 	if IsContextDoneError(err) {
 		return false
 	}
+	if IsAttemptTimeoutError(err) {
+		// attempt 超时是渠道级 TTFB 故障，不终止整条链路：
+		// 总预算（tryChannels 循环顶部的 failoverBudgetError）允许时继续尝试下一个渠道。
+		return true
+	}
 	if IsPoolExhaustedError(err) {
 		return true
 	}
