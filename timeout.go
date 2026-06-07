@@ -62,26 +62,34 @@ const (
 	attemptTimeoutFailover
 )
 
-func (p *Proxy) attemptTimeout(ctx *Context) (time.Duration, attemptTimeoutSource) {
-	if p == nil {
-		return 0, attemptTimeoutNone
-	}
+type attemptDeadlineSpec struct {
+	deadline time.Time
+	source   attemptTimeoutSource
+}
 
-	timeout := p.cfg.AttemptTimeout
-	source := attemptTimeoutNone
-	if timeout > 0 {
-		source = attemptTimeoutAttempt
-	}
-	if ctx != nil && !ctx.FailoverDeadline.IsZero() {
-		remaining := time.Until(ctx.FailoverDeadline)
-		if remaining <= 0 {
-			return 0, attemptTimeoutNone
-		}
-		if timeout <= 0 || remaining <= timeout {
-			return remaining, attemptTimeoutFailover
+func (p *Proxy) attemptDeadline(r *http.Request, ctx *Context, now time.Time) attemptDeadlineSpec {
+	spec := attemptDeadlineSpec{}
+	if p != nil && p.cfg.AttemptTimeout > 0 {
+		spec = attemptDeadlineSpec{
+			deadline: now.Add(p.cfg.AttemptTimeout),
+			source:   attemptTimeoutAttempt,
 		}
 	}
-	return timeout, source
+	if ctx != nil && !ctx.FailoverDeadline.IsZero() && (spec.deadline.IsZero() || !ctx.FailoverDeadline.After(spec.deadline)) {
+		spec = attemptDeadlineSpec{
+			deadline: ctx.FailoverDeadline,
+			source:   attemptTimeoutFailover,
+		}
+	}
+	if r != nil {
+		if parentDeadline, ok := r.Context().Deadline(); ok && (spec.deadline.IsZero() || parentDeadline.Before(spec.deadline)) {
+			spec = attemptDeadlineSpec{
+				deadline: parentDeadline,
+				source:   attemptTimeoutNone,
+			}
+		}
+	}
+	return spec
 }
 
 type attemptRequestCleanup func(resp *http.Response, err error) (attemptTimedOut bool)
@@ -94,66 +102,52 @@ func (p *Proxy) requestForAttempt(r *http.Request, ctx *Context) (*http.Request,
 		return nil, nil, err
 	}
 
-	timeout, timeoutSource := p.attemptTimeout(ctx)
-	if timeout <= 0 {
+	spec := p.attemptDeadline(r, ctx, time.Now())
+	if spec.deadline.IsZero() {
 		return r, func(*http.Response, error) bool { return false }, nil
 	}
 
-	if timeoutSource == attemptTimeoutFailover {
-		deadline := time.Now().Add(timeout)
-		if ctx != nil && !ctx.FailoverDeadline.IsZero() {
-			deadline = ctx.FailoverDeadline
-		}
-		attemptCtx, cancel := context.WithDeadline(r.Context(), deadline)
-		attemptReq := r.WithContext(attemptCtx)
-		oldReq := (*http.Request)(nil)
-		if ctx != nil {
-			oldReq = ctx.Request
-			ctx.Request = attemptReq
-			ctx.AttemptDeadline = deadline
-		}
-		cleanup := func(resp *http.Response, err error) bool {
-			doneErr := attemptCtx.Err()
-			if ctx != nil {
-				ctx.Request = oldReq
-				ctx.AttemptDeadline = time.Time{}
-			}
-			if resp != nil && err == nil && doneErr == nil {
-				attachCancelOnClose(resp, cancel)
-				return false
-			}
+	var attemptCtx context.Context
+	var cancel context.CancelFunc
+	var attemptTimedOut atomic.Bool
+	var stopAttemptTimer func() bool
+	if spec.source == attemptTimeoutAttempt {
+		attemptCtx, cancel = context.WithCancel(r.Context())
+		timer := time.AfterFunc(time.Until(spec.deadline), func() {
+			attemptTimedOut.Store(true)
 			cancel()
-			return false
-		}
-		return attemptReq, cleanup, nil
+		})
+		stopAttemptTimer = timer.Stop
+	} else {
+		attemptCtx, cancel = context.WithDeadline(r.Context(), spec.deadline)
 	}
-
-	attemptCtx, cancel := context.WithCancel(r.Context())
-	var timedOut atomic.Bool
-	timer := time.AfterFunc(timeout, func() {
-		timedOut.Store(true)
-		cancel()
-	})
 	attemptReq := r.WithContext(attemptCtx)
 	oldReq := (*http.Request)(nil)
 	if ctx != nil {
 		oldReq = ctx.Request
 		ctx.Request = attemptReq
-		ctx.AttemptDeadline = time.Now().Add(timeout)
+		ctx.AttemptDeadline = spec.deadline
 	}
 
 	cleanup := func(resp *http.Response, err error) bool {
-		stopped := timer.Stop()
+		attemptTimerStopped := false
+		if stopAttemptTimer != nil {
+			attemptTimerStopped = stopAttemptTimer()
+		}
+		doneErr := attemptCtx.Err()
 		if ctx != nil {
 			ctx.Request = oldReq
 			ctx.AttemptDeadline = time.Time{}
 		}
-		if resp != nil && err == nil && stopped {
+		if resp != nil && err == nil && (doneErr == nil || attemptTimerStopped) {
 			attachCancelOnClose(resp, cancel)
 			return false
 		}
 		cancel()
-		return timedOut.Load()
+		if stopAttemptTimer != nil {
+			return attemptTimedOut.Load()
+		}
+		return false
 	}
 
 	return attemptReq, cleanup, nil

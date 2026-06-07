@@ -423,6 +423,68 @@ func TestTryChannelsFailoverTimeoutDoesNotRecordCircuitFailure(t *testing.T) {
 	}
 }
 
+func TestTryChannelsParentDeadlineDoesNotBecomeAttemptTimeout(t *testing.T) {
+	slowAttempts := 0
+	channels := []Channel{
+		{
+			Id:      1,
+			Name:    "slow",
+			BaseURL: "https://slow.example.com",
+			Enabled: true,
+			CType:   CTypeThird,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "slow-key", Value: "slow-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				slowAttempts++
+				<-ctx.Request.Context().Done()
+				return nil, ctx.Request.Context().Err()
+			},
+		},
+	}
+
+	p := New(Config{
+		Retry:          NoRetry(),
+		AttemptTimeout: 100 * time.Millisecond,
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         1,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Second,
+			Cooldown:           time.Minute,
+		},
+	})
+
+	for i := 0; i < 2; i++ {
+		parentCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`)).WithContext(parentCtx)
+		ctx := &Context{Request: req}
+		result := p.tryChannels(req, ctx, channels, NoRetry())
+		cancel()
+
+		if result.successResp != nil {
+			result.successResp.Body.Close()
+			t.Fatalf("request %d should not succeed", i+1)
+		}
+		if result.lastErr == nil {
+			t.Fatalf("request %d expected parent deadline timeout", i+1)
+		}
+		if IsAttemptTimeoutError(result.lastErr) {
+			t.Fatalf("request %d lastErr=%v, want parent deadline not attempt timeout", i+1, result.lastErr)
+		}
+		if !IsContextDeadlineExceededError(result.lastErr) {
+			t.Fatalf("request %d lastErr=%v, want context deadline exceeded", i+1, result.lastErr)
+		}
+	}
+
+	if slowAttempts != 2 {
+		t.Fatalf("slowAttempts=%d, want=2 because parent deadlines must not open circuit", slowAttempts)
+	}
+	if allowed, _, _ := p.breaker.Allow(&channels[0]); !allowed {
+		t.Fatalf("channel should remain allowed after parent deadline")
+	}
+}
+
 func TestTryChannelsStopsWhenRemainingBudgetBelowMinimum(t *testing.T) {
 	firstAttempts := 0
 	secondAttempts := 0
