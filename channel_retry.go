@@ -407,11 +407,13 @@ func (p *Proxy) evaluateRetryDecision(ctx *Context, cfg RetryConfig, resp *http.
 	decision := retryDecision{}
 	decision.isSSE = isSSEResponse(resp.Header.Get("Content-Type"), ctx.TargetHeader.Get("Accept"))
 	ctx.IsStream = decision.isSSE
+	successfulSSE := decision.isSSE && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
 	if cfg.RetryOnResponse != nil && resp.StatusCode >= http.StatusBadRequest {
 		var body []byte
 		// SSE 不能在重试判定阶段整包读取，否则会破坏流式输出。
-		// 仅在非 SSE 的错误响应上读取完整响应体，供业务层基于 body 判定是否重试。
-		if !decision.isSSE {
+		// 仅对已经建立成功的 SSE 流跳过整包读取；非 2xx SSE 错误响应没有流式成功语义，
+		// 仍按普通错误响应读取 body，供业务层基于 body 判定是否重试。
+		if !successfulSSE {
 			body, _ = io.ReadAll(resp.Body)
 			ctx.LastResponseBody = append([]byte(nil), body...)
 			resp.Body = io.NopCloser(bytes.NewReader(body))
@@ -422,7 +424,7 @@ func (p *Proxy) evaluateRetryDecision(ctx *Context, cfg RetryConfig, resp *http.
 		}
 	}
 
-	if !decision.isSSE || cfg.RetryOnSSE == nil {
+	if !successfulSSE || cfg.RetryOnSSE == nil {
 		return decision
 	}
 

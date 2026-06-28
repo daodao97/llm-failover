@@ -153,17 +153,20 @@ func cloneRequestWithBody(r *http.Request, body []byte) *http.Request {
 
 // peekBody 预读响应体前 n 字节用于判断重试，同时保持 Body 可继续读取
 func peekBody(resp *http.Response, n int) ([]byte, error) {
+	if resp == nil || resp.Body == nil || n <= 0 {
+		return nil, nil
+	}
 	buf := make([]byte, n)
 	read, err := resp.Body.Read(buf)
-	if err != nil && err != io.EOF {
-		return nil, err
-	}
 	orig := resp.Body
 	resp.Body = &readerWithCloser{
 		Reader: io.MultiReader(bytes.NewReader(buf[:read]), orig),
 		Closer: orig,
 	}
-	return buf[:read], nil
+	if err == io.EOF {
+		err = nil
+	}
+	return buf[:read], err
 }
 
 // backoff 计算指数退避延迟时间
