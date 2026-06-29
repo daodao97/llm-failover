@@ -424,13 +424,21 @@ func (p *Proxy) evaluateRetryDecision(ctx *Context, cfg RetryConfig, resp *http.
 		}
 	}
 
-	if !successfulSSE || cfg.RetryOnSSE == nil {
+	if !successfulSSE {
 		return decision
 	}
 
 	peek, _ := peekBody(resp, 512)
 	decision.ssePeek = peek
-	if !cfg.RetryOnSSE(isSSEError(peek)) {
+
+	// 空 SSE（成功状态码 + text/event-stream，但首读即 0 字节）永远判失败：这种响应没有
+	// 任何成功语义，一旦作为 200 提交给客户端就无法再 failover/改状态码。因此空流不依赖业务
+	// 是否配置 RetryOnSSE——只有非空首包的“软错误”（如 event: error）才交给 RetryOnSSE 决定。
+	retry := len(peek) == 0
+	if !retry && cfg.RetryOnSSE != nil {
+		retry = cfg.RetryOnSSE(isSSEError(peek))
+	}
+	if !retry {
 		return decision
 	}
 

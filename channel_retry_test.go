@@ -132,6 +132,29 @@ func TestEvaluateRetryDecisionDoesNotBufferSuccessfulSSE(t *testing.T) {
 	}
 }
 
+func TestEvaluateRetryDecisionEmptySSEAlwaysRetries(t *testing.T) {
+	p := &Proxy{}
+	ctx := &Context{
+		TargetHeader: http.Header{
+			"Accept": []string{"text/event-stream"},
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type": []string{"text/event-stream"},
+		},
+		Body: io.NopCloser(strings.NewReader("")),
+	}
+
+	// 不配置 RetryOnSSE：空流仍必须判为可重试，否则会作为 200 空 SSE 提交给客户端。
+	decision := p.evaluateRetryDecision(ctx, RetryConfig{}, resp)
+
+	if decision.reason != "sse_error: empty response" {
+		t.Fatalf("decision.reason=%q, want %q", decision.reason, "sse_error: empty response")
+	}
+}
+
 func TestEvaluateRetryDecisionSkipsSSEProbeForHTTPErrorStatus(t *testing.T) {
 	retryOnSSECalled := false
 	p := &Proxy{}
