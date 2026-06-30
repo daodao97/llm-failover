@@ -53,6 +53,7 @@ func (p *Proxy) tryChannel(r *http.Request, ctx *Context, ch *Channel, cfg Retry
 			}
 
 			ctx.resetForAttempt(keyHeader)
+			prepareStreamRequestHeaders(ctx.TargetHeader, ctx)
 			ctx.Attempt = attempt
 			currentKey := &keys[keyIdx]
 			p.observer().OnAttemptStart(ctx, ch, currentKey)

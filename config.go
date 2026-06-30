@@ -95,9 +95,14 @@ type Context struct {
 	LastStatusCode     int
 	LastResponseHeader http.Header
 	LastResponseBody   []byte
-	PoolStats          PoolStats
-	FailoverDeadline   time.Time
-	AttemptDeadline    time.Time
+	// UpstreamResponseHeader records response headers as received from the upstream before
+	// internal decoding/removal of Content-Encoding and Content-Length.
+	UpstreamResponseHeader   http.Header
+	ResponseDecoded          bool
+	ResponseContentEncodings []string
+	PoolStats                PoolStats
+	FailoverDeadline         time.Time
+	AttemptDeadline          time.Time
 	// StreamReadErr 记录转发响应体时上游侧的读错误（如 SSE 半路断流）。
 	// 客户端断开会以 context 取消的形式出现，不计入渠道失败。
 	StreamReadErr error
@@ -119,6 +124,9 @@ func (c *Context) resetForChannel() {
 	c.LastStatusCode = 0
 	c.LastResponseHeader = nil
 	c.LastResponseBody = nil
+	c.UpstreamResponseHeader = nil
+	c.ResponseDecoded = false
+	c.ResponseContentEncodings = nil
 	c.PoolStats = PoolStats{}
 	c.StreamReadErr = nil
 	c.RequestBody = cloneBytes(c.OriginalRequestBody)
@@ -133,6 +141,9 @@ func (c *Context) resetForAttempt(targetHeader http.Header) {
 	c.LastStatusCode = 0
 	c.LastResponseHeader = nil
 	c.LastResponseBody = nil
+	c.UpstreamResponseHeader = nil
+	c.ResponseDecoded = false
+	c.ResponseContentEncodings = nil
 }
 
 func cloneBytes(src []byte) []byte {

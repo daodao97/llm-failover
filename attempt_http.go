@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"strings"
 	"sync"
 	"time"
 )
@@ -62,6 +63,7 @@ func (p *Proxy) executeHTTPAttempt(r *http.Request, ctx *Context, ch *Channel, k
 	}
 
 	// 应用目标请求头
+	prepareStreamRequestHeaders(ctx.TargetHeader, ctx)
 	for k, vv := range ctx.TargetHeader {
 		for _, v := range vv {
 			req.Header.Add(k, v)
@@ -69,6 +71,7 @@ func (p *Proxy) executeHTTPAttempt(r *http.Request, ctx *Context, ch *Channel, k
 	}
 	// 渠道静态头最高优先级，覆盖已有值
 	applyChannelHeaders(req.Header, ch)
+	prepareStreamRequestHeaders(req.Header, ctx)
 
 	if ch.AcquireKey != nil {
 		if ok := ch.AcquireKey(key.ID); !ok {
@@ -150,12 +153,29 @@ func (p *Proxy) executeHTTPAttempt(r *http.Request, ctx *Context, ch *Channel, k
 		}
 		return nil, errEmptyResponseHTTPClient
 	}
+	if ctx != nil {
+		ctx.UpstreamResponseHeader = resp.Header.Clone()
+	}
+	decodeInfo, err := decodeCompressedResponse(resp)
+	if err != nil {
+		_ = resp.Body.Close()
+		if releaseKey != nil {
+			releaseKey()
+		}
+		return nil, err
+	}
+	if ctx != nil {
+		ctx.ResponseDecoded = decodeInfo.Decoded
+		ctx.ResponseContentEncodings = decodeInfo.Encodings
+	}
 
 	attachReleaseOnClose(resp, releaseKey)
 
 	// 记录响应日志
 	p.logger().DebugCtx(r.Context(), "proxy response",
 		"status", resp.StatusCode,
+		"decoded", decodeInfo.Decoded,
+		"content_encodings", decodeInfo.Encodings,
 		"headers", formatHeaders(resp.Header),
 	)
 
@@ -204,4 +224,23 @@ func (r *releaseOnClose) Close() error {
 		r.once.Do(r.release)
 	}
 	return err
+}
+
+func prepareStreamRequestHeaders(h http.Header, ctx *Context) {
+	if h == nil {
+		return
+	}
+	if !isStreamRequestHeader(h, ctx) {
+		return
+	}
+	if h.Get("Accept") == "" || h.Get("Accept") == "*/*" {
+		h.Set("Accept", "text/event-stream")
+	}
+}
+
+func isStreamRequestHeader(h http.Header, ctx *Context) bool {
+	if ctx != nil && ctx.IsStream {
+		return true
+	}
+	return strings.Contains(strings.ToLower(h.Get("Accept")), "text/event-stream")
 }
