@@ -216,7 +216,9 @@ type Channel struct {
 	ChannelGroupID int
 	// ChannelGroupMultiplier 标记该运行时渠道所属分组的计费倍率；默认 1。
 	ChannelGroupMultiplier decimal.Decimal
-	Headers                http.Header
+	// CostMultiplier 标记该运行时渠道的成本系数；用于核算渠道真实成本，默认 1。
+	CostMultiplier decimal.Decimal
+	Headers        http.Header
 	// ModelRewrite 按顺序匹配请求中的 model 并重写
 	ModelRewrite []ModelRewriteRule
 	Handler      func(ctx *Context) (*http.Response, error)
@@ -296,6 +298,7 @@ func NewChannel(id int, name, baseURL string) Channel {
 		BaseURL:                baseURL,
 		Enabled:                true,
 		ChannelGroupMultiplier: decimal.NewFromInt(1),
+		CostMultiplier:         decimal.NewFromInt(1),
 		Headers:                make(http.Header),
 	}
 }
