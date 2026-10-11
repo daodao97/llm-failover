@@ -237,6 +237,59 @@ func TestServeHTTPAttemptTimeoutFailsOverToNextChannel(t *testing.T) {
 	}
 }
 
+func TestServeHTTPChannelAttemptTimeoutOverridesConfig(t *testing.T) {
+	secondAttempts := 0
+	channels := []Channel{
+		{
+			Id:             1,
+			Name:           "slow",
+			BaseURL:        "https://slow.example.com",
+			Enabled:        true,
+			AttemptTimeout: 20 * time.Millisecond,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "slow-key", Value: "slow-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				<-ctx.Request.Context().Done()
+				return nil, ctx.Request.Context().Err()
+			},
+		},
+		{
+			Id:      2,
+			Name:    "backup",
+			BaseURL: "https://backup.example.com",
+			Enabled: true,
+			GetKeys: func(ctx *Context) []Key {
+				return []Key{{ID: "backup-key", Value: "backup-value"}}
+			},
+			Handler: func(ctx *Context) (*http.Response, error) {
+				secondAttempts++
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody}, nil
+			},
+		},
+	}
+
+	p := New(Config{
+		Channels:        channels,
+		Retry:           NoRetry(),
+		FailoverTimeout: 2 * time.Second,
+		AttemptTimeout:  time.Second,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	rec := httptest.NewRecorder()
+
+	start := time.Now()
+	p.ServeHTTP(rec, req)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusOK || secondAttempts != 1 {
+		t.Fatalf("status=%d secondAttempts=%d body=%s", rec.Code, secondAttempts, rec.Body.String())
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("channel AttemptTimeout should override Config.AttemptTimeout, elapsed=%s", elapsed)
+	}
+}
+
 func TestServeHTTPAttemptTimeoutSkipsSameKeyRetryAndRotatesKeys(t *testing.T) {
 	attemptsByKey := map[string]int{}
 	channels := []Channel{

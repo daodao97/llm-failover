@@ -130,11 +130,12 @@ func (e *memoryChannelCircuitEntry) expired(now time.Time) bool {
 
 // channelCircuitBreaker 维护渠道短时间失败状态，避免持续串行试错。
 type channelCircuitBreaker struct {
-	now    func() time.Time
-	scope  string
-	cfg    CircuitBreakerConfig
-	store  CircuitBreakerStore
-	logger Logger
+	now           func() time.Time
+	scope         string
+	cfg           CircuitBreakerConfig
+	store         CircuitBreakerStore
+	logger        Logger
+	channelScopes sync.Map // 已使用的额外命名空间，供快照与清理遍历
 
 	errLogMu     sync.Mutex
 	lastErrLogAt time.Time
@@ -334,7 +335,7 @@ func (b *channelCircuitBreaker) Allow(ch *Channel) (bool, time.Duration, bool) {
 	allowed := true
 	wait := time.Duration(0)
 	probe := false
-	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+	err := b.store.update(b.channelScope(ch), channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		updateChannelCircuitStateMetadata(state, ch)
 		state.events = trimEvents(state.events, now, b.cfg.FailureWindow)
 		state.updatedAt = now
@@ -416,7 +417,7 @@ func (b *channelCircuitBreaker) CancelProbe(ch *Channel) {
 	}
 
 	now := b.now()
-	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+	err := b.store.update(b.channelScope(ch), channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		if !state.halfOpen {
 			return false, b.stateTTL(state, now)
 		}
@@ -434,7 +435,7 @@ func (b *channelCircuitBreaker) TrackChannel(ch *Channel, circuitBreakerWhitelis
 	}
 
 	now := b.now()
-	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+	err := b.store.update(b.channelScope(ch), channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		updateChannelCircuitStateMetadata(state, ch)
 		state.circuitBreakerWhitelisted = circuitBreakerWhitelisted
 		state.updatedAt = now
@@ -449,7 +450,7 @@ func (b *channelCircuitBreaker) RecordSuccess(ch *Channel, latency time.Duration
 	}
 
 	now := b.now()
-	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+	err := b.store.update(b.channelScope(ch), channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		updateChannelCircuitStateMetadata(state, ch)
 		state.circuitBreakerWhitelisted = false
 		event := channelCircuitEvent{
@@ -510,7 +511,7 @@ func (b *channelCircuitBreaker) RecordWhitelistedSuccess(ch *Channel, latency ti
 	}
 
 	now := b.now()
-	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+	err := b.store.update(b.channelScope(ch), channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		updateChannelCircuitStateMetadata(state, ch)
 		state.circuitBreakerWhitelisted = true
 		b.appendEvent(state, channelCircuitEvent{
@@ -539,7 +540,7 @@ func (b *channelCircuitBreaker) RecordFailure(ch *Channel, latency time.Duration
 	}
 
 	now := b.now()
-	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+	err := b.store.update(b.channelScope(ch), channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		updateChannelCircuitStateMetadata(state, ch)
 		state.circuitBreakerWhitelisted = false
 		event := channelCircuitEvent{
@@ -594,7 +595,7 @@ func (b *channelCircuitBreaker) RecordWhitelistedFailure(ch *Channel, latency ti
 	}
 
 	now := b.now()
-	err := b.store.update(b.scope, channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
+	err := b.store.update(b.channelScope(ch), channelCircuitKey(ch), newChannelCircuitState(ch), func(state *channelCircuitState) (bool, time.Duration) {
 		updateChannelCircuitStateMetadata(state, ch)
 		state.circuitBreakerWhitelisted = true
 		b.appendEvent(state, channelCircuitEvent{
@@ -620,13 +621,46 @@ func (b *channelCircuitBreaker) RecordWhitelistedFailure(ch *Channel, latency ti
 	b.logStoreError("record_whitelisted_failure", err)
 }
 
+// channelScope 只改变存储命名空间，不改变渠道 key 或熔断策略。
+func (b *channelCircuitBreaker) channelScope(ch *Channel) string {
+	if ch != nil && strings.TrimSpace(ch.CircuitBreakerScope) != "" {
+		scope := strings.TrimSpace(ch.CircuitBreakerScope)
+		b.channelScopes.Store(scope, struct{}{})
+		return scope
+	}
+	return b.scope
+}
+
+func (b *channelCircuitBreaker) scopes() []string {
+	scopes := []string{b.scope}
+	b.channelScopes.Range(func(key, _ any) bool {
+		if scope := key.(string); scope != b.scope {
+			scopes = append(scopes, scope)
+		}
+		return true
+	})
+	sort.Strings(scopes)
+	return scopes
+}
+
 func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	var snapshots []ChannelHealthSnapshot
+	for _, scope := range b.scopes() {
+		snapshots = append(snapshots, b.snapshotScope(scope)...)
+	}
+	return snapshots
+}
+
+func (b *channelCircuitBreaker) snapshotScope(scope string) []ChannelHealthSnapshot {
 	if b == nil || b.store == nil {
 		return nil
 	}
 
 	now := b.now()
-	entries, err := b.store.snapshot(b.scope)
+	entries, err := b.store.snapshot(scope)
 	if err != nil {
 		b.logStoreError("snapshot", err)
 		return nil
@@ -638,7 +672,7 @@ func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
 		state.events = trimEvents(state.events, now, b.cfg.FailureWindow)
 		if len(state.events) == 0 && !state.openUntil.After(now) && !state.halfOpen {
 			if !state.circuitBreakerWhitelisted {
-				_, _ = b.store.resetChannelByKey(b.scope, key)
+				_, _ = b.store.resetChannelByKey(scope, key)
 				continue
 			}
 		}
@@ -676,7 +710,7 @@ func (b *channelCircuitBreaker) Snapshot() []ChannelHealthSnapshot {
 		}
 
 		snapshots = append(snapshots, ChannelHealthSnapshot{
-			Scope:                     b.scope,
+			Scope:                     scope,
 			ChannelKey:                key,
 			ChannelID:                 state.channelID,
 			ChannelName:               state.name,
@@ -746,32 +780,41 @@ func (b *channelCircuitBreaker) Reset() int {
 		return 0
 	}
 
-	count, err := b.store.reset(b.scope)
-	if err != nil {
-		b.logStoreError("reset", err)
-		return 0
+	var count int
+	for _, scope := range b.scopes() {
+		n, err := b.store.reset(scope)
+		if err != nil {
+			b.logStoreError("reset", err)
+			continue
+		}
+		count += n
 	}
 	return count
 }
 
 func (b *channelCircuitBreaker) ResetChannel(ch *Channel) bool {
-	if ch == nil {
+	if b == nil || b.store == nil || ch == nil {
 		return false
 	}
-	return b.ResetChannelByKey(channelCircuitKey(ch))
+	ok, err := b.store.resetChannelByKey(b.channelScope(ch), channelCircuitKey(ch))
+	b.logStoreError("reset_channel", err)
+	return ok
 }
 
 func (b *channelCircuitBreaker) ResetChannelByKey(channelKey string) bool {
 	if b == nil || b.store == nil || channelKey == "" {
 		return false
 	}
-
-	ok, err := b.store.resetChannelByKey(b.scope, channelKey)
-	if err != nil {
-		b.logStoreError("reset_channel", err)
-		return false
+	var reset bool
+	for _, scope := range b.scopes() {
+		ok, err := b.store.resetChannelByKey(scope, channelKey)
+		if err != nil {
+			b.logStoreError("reset_channel", err)
+			continue
+		}
+		reset = reset || ok
 	}
-	return ok
+	return reset
 }
 
 func (r *channelBreakerRegistry) register(b *channelCircuitBreaker) {

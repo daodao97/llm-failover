@@ -219,10 +219,14 @@ type ModelRewriteRule struct {
 }
 
 type Channel struct {
-	Id      int
-	Name    string
-	BaseURL string
-	Enabled bool
+	// CircuitBreakerScope 覆盖当前渠道的熔断命名空间；为空时沿用 Config.BreakerScope。
+	CircuitBreakerScope string
+	// AttemptTimeout 覆盖当前渠道的单次 attempt 超时；为空时沿用 Config.AttemptTimeout。
+	AttemptTimeout time.Duration
+	Id             int
+	Name           string
+	BaseURL        string
+	Enabled        bool
 	// ChannelGroupID 标记该运行时渠道是从哪个 token 渠道分组展开出来的；0 表示非分组来源。
 	ChannelGroupID int
 	// ChannelGroupMultiplier 标记该运行时渠道所属分组的计费倍率；默认 1。

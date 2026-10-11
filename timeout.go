@@ -69,9 +69,16 @@ type attemptDeadlineSpec struct {
 
 func (p *Proxy) attemptDeadline(r *http.Request, ctx *Context, now time.Time) attemptDeadlineSpec {
 	spec := attemptDeadlineSpec{}
-	if p != nil && p.cfg.AttemptTimeout > 0 {
+	attemptTimeout := time.Duration(0)
+	if p != nil {
+		attemptTimeout = p.cfg.AttemptTimeout
+	}
+	if ctx != nil && ctx.Channel != nil && ctx.Channel.AttemptTimeout > 0 {
+		attemptTimeout = ctx.Channel.AttemptTimeout
+	}
+	if attemptTimeout > 0 {
 		spec = attemptDeadlineSpec{
-			deadline: now.Add(p.cfg.AttemptTimeout),
+			deadline: now.Add(attemptTimeout),
 			source:   attemptTimeoutAttempt,
 		}
 	}

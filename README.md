@@ -850,3 +850,13 @@ SSE 比普通 JSON 返回更容易出现“连接成功但内容失败”的情�
 2. 收敛与业务强相关的字段，继续抽象公共接口
 3. 补充更明确的公开 API 文档
 4. 增加指标导出和健康快照接口
+
+### 渠道级熔断作用域
+
+渠道可设置 `Channel.CircuitBreakerScope`，为空时沿用 `Config.BreakerScope`。实际 scope 用于状态存储、健康快照与 reset，使同一重试链上的渠道可以使用不同命名空间，也可以复用其他代理实例的 Redis 熔断状态。
+
+请求和响应的协议适配由宿主通过已有 hooks 与 HTTP 适配器完成，本库不定义转换生命周期或转换错误。
+
+### 渠道级 attempt 超时
+
+渠道可设置 `Channel.AttemptTimeout`，为空时沿用 `Config.AttemptTimeout`。同一重试链混合不同上游协议时，可按渠道实际协议使用各自的单次 attempt 超时。
