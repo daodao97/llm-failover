@@ -101,6 +101,11 @@ func applyKeyHeader(h http.Header, key, keyType string) {
 	}
 }
 
+// IsSSEResponse 检测响应是否为 SSE 流式响应，规则同 isSSEResponse。
+func IsSSEResponse(respContentType, reqAccept string) bool {
+	return isSSEResponse(respContentType, reqAccept)
+}
+
 // isSSEResponse 检测响应是否为 SSE 流式响应
 // 检测规则：
 // 1. Content-Type 包含 text/event-stream

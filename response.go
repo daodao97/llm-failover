@@ -169,18 +169,7 @@ func (p *Proxy) streamSSEWithTransform(w http.ResponseWriter, body io.Reader, ct
 	}
 
 	emitEvent := func(event SSEEvent) {
-		if event.Event != "" {
-			fmt.Fprintf(w, "event: %s\n", event.Event)
-		}
-		if event.ID != "" {
-			fmt.Fprintf(w, "id: %s\n", event.ID)
-		}
-		if event.Data != "" {
-			for _, line := range strings.Split(event.Data, "\n") {
-				fmt.Fprintf(w, "data: %s\n", line)
-			}
-		}
-		fmt.Fprint(w, "\n")
+		WriteSSEEvent(w, event)
 		flush()
 	}
 

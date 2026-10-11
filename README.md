@@ -860,3 +860,9 @@ SSE 比普通 JSON 返回更容易出现“连接成功但内容失败”的情�
 ### 渠道级 attempt 超时
 
 渠道可设置 `Channel.AttemptTimeout`，为空时沿用 `Config.AttemptTimeout`。同一重试链混合不同上游协议时，可按渠道实际协议使用各自的单次 attempt 超时。
+
+### 宿主可复用的辅助函数
+
+- `RewriteModel(model, rules)`：按渠道 `ModelRewrite` 规则计算重写后的模型，与库内实际重写一致。
+- `IsSSEResponse(contentType, accept)` / `WriteSSEEvent(w, event)`：与库内一致的 SSE 判定与事件序列化。
+- `NewRequestError(type, status, err)`：`GetChannels` 返回该错误时，客户端错误类型与状态码以其为准，不再按错误文本推断。

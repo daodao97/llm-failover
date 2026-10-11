@@ -185,6 +185,11 @@ func buildModelRewriteRules(rules []ThirdModelRewrite) []ModelRewriteRule {
 	return result
 }
 
+// RewriteModel 按渠道规则（精确匹配优先，其次 path.Match 通配）计算重写后的模型。
+func RewriteModel(model string, rules []ModelRewriteRule) (string, bool) {
+	return rewriteModelByRules(model, rules)
+}
+
 func rewriteModelByRules(model string, rules []ModelRewriteRule) (string, bool) {
 	if model == "" || len(rules) == 0 {
 		return model, false

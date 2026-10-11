@@ -45,7 +45,12 @@ func (p *Proxy) prepareRequestBody(w http.ResponseWriter, ctx *Context) error {
 func (p *Proxy) selectChannels(w http.ResponseWriter, r *http.Request, ctx *Context) ([]Channel, error) {
 	channels, err := p.enabledChannels(cloneRequestWithBody(r, ctx.RequestBody))
 	if err != nil {
-		p.writeGeneratedErrorResponse(w, ctx, "api_error", err.Error(), classifySelectChannelsStatus(err), err)
+		errType, status := "api_error", classifySelectChannelsStatus(err)
+		var requestErr *RequestError
+		if errors.As(err, &requestErr) {
+			errType, status = requestErr.Type, requestErr.StatusCode
+		}
+		p.writeGeneratedErrorResponse(w, ctx, errType, err.Error(), status, err)
 		return nil, err
 	}
 	if len(channels) == 0 {
