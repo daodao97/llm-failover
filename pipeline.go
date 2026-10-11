@@ -398,6 +398,9 @@ func (p *Proxy) isCircuitBreakerWhitelisted(ch *Channel) bool {
 	if p == nil || ch == nil {
 		return false
 	}
+	if ch.CircuitBreakerExempt {
+		return true
+	}
 	for _, item := range p.cfg.CircuitBreakerWhitelist {
 		if circuitBreakerWhitelistMatch(item, ch) {
 			return true
