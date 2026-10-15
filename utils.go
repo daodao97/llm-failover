@@ -241,6 +241,9 @@ func IsPoolExhaustedError(err error) bool {
 }
 
 func finalErrorStatusCode(ctx *Context, err error) int {
+	if IsCircuitOpenError(err) {
+		return http.StatusServiceUnavailable
+	}
 	if IsAttemptTimeoutError(err) {
 		return http.StatusGatewayTimeout
 	}
@@ -332,8 +335,13 @@ func wrapChannelError(ch *Channel, err error) error {
 	return &channelError{label: label, err: err}
 }
 
-// errCircuitOpen 表示渠道因熔断被跳过。
-var errCircuitOpen = errors.New("circuit open")
+// ErrCircuitOpen 表示渠道因熔断被跳过。
+var ErrCircuitOpen = errors.New("circuit open")
+
+// IsCircuitOpenError 判断错误是否为渠道熔断跳过。
+func IsCircuitOpenError(err error) bool {
+	return errors.Is(err, ErrCircuitOpen)
+}
 
 // clientFailureMessage 生成全部渠道失败时的客户端文案，返回失败所属渠道标识（用于前缀）与文案。
 // involved 为本次请求实际尝试或因熔断跳过的渠道数。
@@ -353,7 +361,7 @@ func clientFailureMessage(err error, involved int) (label, message string) {
 	switch {
 	case involved > 1:
 		headline = "all channels failed"
-	case errors.Is(err, errCircuitOpen):
+	case errors.Is(err, ErrCircuitOpen):
 		headline = "channel temporarily unavailable"
 	}
 	if reason == "" {

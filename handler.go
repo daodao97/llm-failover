@@ -17,6 +17,8 @@ type pipelineResult struct {
 	lastErr     error
 	// involved 为实际尝试或因熔断跳过的渠道数，用于选择最终错误文案。
 	involved int
+	// skipped 为第一个因熔断被跳过的渠道；没有渠道被实际尝试时用它回调 OnError，保证请求有记录。
+	skipped *Channel
 }
 
 type retryDecision struct {

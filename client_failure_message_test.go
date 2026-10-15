@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tidwall/gjson"
 )
@@ -23,7 +24,7 @@ func TestClientFailureMessage(t *testing.T) {
 		wantMsg   string
 	}{
 		{"single attempt", wrapChannelError(ch, fmt.Errorf("retry: %s", "sse_error: empty response")), 1, label, "upstream request failed: sse_error: empty response"},
-		{"circuit open", wrapChannelError(ch, errCircuitOpen), 1, label, "channel temporarily unavailable: circuit open"},
+		{"circuit open", wrapChannelError(ch, ErrCircuitOpen), 1, label, "channel temporarily unavailable: circuit open"},
 		{"several channels", wrapChannelError(ch, errors.New("status: 503")), 3, label, "all channels failed: status: 503"},
 		{"unlabeled", errors.New("failover timeout exceeded"), 2, "", "all channels failed: failover timeout exceeded"},
 	}
@@ -74,6 +75,59 @@ func TestServeHTTPFailurePrefixShowsTraceAndGroupOnce(t *testing.T) {
 
 	msg := gjson.Get(w.Body.String(), "error.message").String()
 	if want := "[trace-1 " + MaskChannelName("78") + " 10] upstream request failed: status: 502"; msg != want {
+		t.Fatalf("error.message = %q, want %q", msg, want)
+	}
+}
+
+func TestServeHTTPAllChannelsCircuitOpenStillCallsOnError(t *testing.T) {
+	ch := Channel{
+		Id:             113,
+		Name:           "aws",
+		ChannelGroupID: 9,
+		Enabled:        true,
+		GetKeys:        func(ctx *Context) []Key { return []Key{{ID: "k1", Value: "k1"}} },
+		Handler: func(ctx *Context) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header), Body: http.NoBody}, nil
+		},
+	}
+	var gotChannel *Channel
+	var gotErr *ErrorResponse
+	p := New(Config{
+		Channels: []Channel{ch},
+		Retry:    NoRetry(),
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            true,
+			MinSamples:         2,
+			ErrorRateThreshold: 1,
+			FailureWindow:      time.Second,
+			Cooldown:           time.Minute,
+		},
+		ShouldCountFailureForCircuit: func(ctx *Context, ch *Channel, err error) bool { return true },
+		OnError: func(ctx *Context, err *ErrorResponse) {
+			gotChannel, gotErr = ctx.Channel, err
+		},
+	})
+
+	serve := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+		req = req.WithContext(SetTraceID(req.Context(), "trace-9"))
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+		return w
+	}
+	serve()
+	serve()
+
+	gotChannel, gotErr = nil, nil
+	w := serve()
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if gotChannel == nil || gotChannel.Id != 113 || gotErr == nil || !IsCircuitOpenError(gotErr.Err) {
+		t.Fatalf("OnError not called with skipped channel: channel=%+v err=%+v", gotChannel, gotErr)
+	}
+	msg := gjson.Get(w.Body.String(), "error.message").String()
+	if want := "[trace-9 " + MaskChannelName("113") + " 9] channel temporarily unavailable: circuit open"; msg != want {
 		t.Fatalf("error.message = %q, want %q", msg, want)
 	}
 }

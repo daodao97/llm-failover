@@ -97,8 +97,11 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 				p.breaker.TrackChannel(&channels[i], true)
 			} else if allowed, wait, probe := p.breaker.Allow(&channels[i]); !allowed {
 				result.involved++
+				if result.skipped == nil {
+					result.skipped = &channels[i]
+				}
 				if result.lastErr == nil {
-					result.lastErr = wrapChannelError(&channels[i], errCircuitOpen)
+					result.lastErr = wrapChannelError(&channels[i], ErrCircuitOpen)
 				}
 				p.observer().OnChannelSkipped(ctx, &channels[i], "circuit_open")
 				p.logger().InfoCtx(r.Context(), "channel skipped by circuit breaker",
@@ -342,6 +345,10 @@ func (p *Proxy) writePipelineResponse(w http.ResponseWriter, r *http.Request, ct
 		}
 		if p.writeUpstreamErrorResponse(w, r, ctx, result.lastErr) {
 			return
+		}
+		if ctx.Channel == nil && result.skipped != nil {
+			// 全部渠道都因熔断被跳过：以被跳过的渠道回调 OnError，让业务层能记录这次失败。
+			ctx.Channel = result.skipped
 		}
 		label, message := clientFailureMessage(result.lastErr, result.involved)
 		p.writeLabeledErrorResponse(w, ctx, label, "api_error", message, finalErrorStatusCode(ctx, result.lastErr), result.lastErr)
