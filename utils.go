@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
-	"strconv"
 )
 
 var clientErrorURLPattern = regexp.MustCompile(`https?://[^\s"']+`)
@@ -305,21 +304,62 @@ func sanitizeClientFacingErrorMessage(message string) string {
 	return strings.TrimSpace(message)
 }
 
+// channelError 为渠道错误附加渠道标识。Error() 保持 "[label] cause" 格式供日志和用量记录使用；
+// 最终客户端文案通过 label 只在前缀中展示一次渠道标识。
+type channelError struct {
+	label string
+	err   error
+}
+
+func (e *channelError) Error() string { return "[" + e.label + "] " + e.err.Error() }
+
+func (e *channelError) Unwrap() error { return e.err }
+
 func wrapChannelError(ch *Channel, err error) error {
 	if ch == nil || err == nil {
 		return err
 	}
 
-	channelName := MaskChannelName(strconv.Itoa(ch.Id))
-	if channelName == "" {
+	label := ChannelLabel(ch)
+	if label == "" {
 		return err
 	}
 
-	prefix := fmt.Sprintf("[%s]", channelName)
-	if strings.HasPrefix(err.Error(), prefix) {
+	var existing *channelError
+	if errors.As(err, &existing) && existing.label == label {
 		return err
 	}
-	return fmt.Errorf("%s %w", prefix, err)
+	return &channelError{label: label, err: err}
+}
+
+// errCircuitOpen 表示渠道因熔断被跳过。
+var errCircuitOpen = errors.New("circuit open")
+
+// clientFailureMessage 生成全部渠道失败时的客户端文案，返回失败所属渠道标识（用于前缀）与文案。
+// involved 为本次请求实际尝试或因熔断跳过的渠道数。
+func clientFailureMessage(err error, involved int) (label, message string) {
+	reason := ""
+	if err != nil {
+		reason = err.Error()
+	}
+	var chErr *channelError
+	if errors.As(err, &chErr) {
+		label = chErr.label
+		reason = chErr.err.Error()
+	}
+	reason = strings.TrimPrefix(reason, "retry: ")
+
+	headline := "upstream request failed"
+	switch {
+	case involved > 1:
+		headline = "all channels failed"
+	case errors.Is(err, errCircuitOpen):
+		headline = "channel temporarily unavailable"
+	}
+	if reason == "" {
+		return label, headline
+	}
+	return label, headline + ": " + reason
 }
 
 func stripChannelErrorPrefix(message string) string {

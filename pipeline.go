@@ -96,9 +96,9 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 			if p.isCircuitBreakerWhitelisted(&channels[i]) {
 				p.breaker.TrackChannel(&channels[i], true)
 			} else if allowed, wait, probe := p.breaker.Allow(&channels[i]); !allowed {
-				channelName := MaskChannelName(strconv.Itoa(channels[i].Id))
+				result.involved++
 				if result.lastErr == nil {
-					result.lastErr = fmt.Errorf("channel circuit open: [%s]", channelName)
+					result.lastErr = wrapChannelError(&channels[i], errCircuitOpen)
 				}
 				p.observer().OnChannelSkipped(ctx, &channels[i], "circuit_open")
 				p.logger().InfoCtx(r.Context(), "channel skipped by circuit breaker",
@@ -113,6 +113,7 @@ func (p *Proxy) tryChannels(r *http.Request, ctx *Context, channels []Channel, r
 			}
 		}
 
+		result.involved++
 		ctx.resetForChannel()
 		ctx.Channel = &channels[i]
 		ctx.ChannelIdx = i
@@ -342,7 +343,8 @@ func (p *Proxy) writePipelineResponse(w http.ResponseWriter, r *http.Request, ct
 		if p.writeUpstreamErrorResponse(w, r, ctx, result.lastErr) {
 			return
 		}
-		p.writeGeneratedErrorResponse(w, ctx, "api_error", "all channels failed: "+result.lastErr.Error(), finalErrorStatusCode(ctx, result.lastErr), result.lastErr)
+		label, message := clientFailureMessage(result.lastErr, result.involved)
+		p.writeLabeledErrorResponse(w, ctx, label, "api_error", message, finalErrorStatusCode(ctx, result.lastErr), result.lastErr)
 		return
 	}
 
@@ -501,6 +503,7 @@ func (p *Proxy) writeUpstreamErrorResponse(w http.ResponseWriter, r *http.Reques
 		errResp.Header.Set("Content-Type", "application/json")
 	} else if ctx.LastStatusCode > http.StatusOK {
 		prefix := errorPrefix(r, ctx)
+		clientMessage := ""
 		for _, path := range retryReasonMessagePaths() {
 			if message := gjson.GetBytes(data, path); message.Exists() {
 				prefixed := sanitizeUpstreamErrorMessage(message.String())
@@ -508,7 +511,14 @@ func (p *Proxy) writeUpstreamErrorResponse(w http.ResponseWriter, r *http.Reques
 					prefixed = fmt.Sprintf("%s %s", prefix, prefixed)
 				}
 				data, _ = sjson.SetBytes(data, path, prefixed)
+				if clientMessage == "" {
+					clientMessage = prefixed
+				}
 			}
+		}
+		if clientMessage != "" {
+			// 跨协议时 body 会被丢弃并按 Message 重新渲染，Message 需与 body 文案一致。
+			errResp.Message = clientMessage
 		}
 		if errType := gjson.GetBytes(data, "error.type"); errType.Exists() {
 			data, _ = sjson.SetBytes(data, "error.type", "proxy_error")
@@ -563,9 +573,13 @@ func sanitizeUpstreamErrorMessage(message string) string {
 }
 
 func errorPrefix(r *http.Request, ctx *Context) string {
-	channelName := ""
-	if ctx != nil && ctx.Channel != nil {
-		channelName = MaskChannelName(strconv.Itoa(ctx.Channel.Id))
+	return errorPrefixWithLabel(r, ctx, "")
+}
+
+// errorPrefixWithLabel 生成 "[trace_id channel_label]" 前缀；label 为空时取当前渠道标识。
+func errorPrefixWithLabel(r *http.Request, ctx *Context, channelName string) string {
+	if channelName == "" && ctx != nil && ctx.Channel != nil {
+		channelName = ChannelLabel(ctx.Channel)
 	}
 
 	if r != nil {

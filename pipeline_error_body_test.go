@@ -114,7 +114,7 @@ func TestServeHTTPFallsBackToStatusWhenNoErrorBody(t *testing.T) {
 	}
 
 	msg := gjson.Get(w.Body.String(), "error.message").String()
-	if !strings.Contains(msg, "all channels failed: ["+MaskChannelName("102")+"] retry: status: 400") {
+	if want := "[" + MaskChannelName("102") + "] upstream request failed: status: 400"; msg != want {
 		t.Fatalf("error.message=%q", msg)
 	}
 }

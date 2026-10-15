@@ -320,8 +320,13 @@ func (p *Proxy) enabledChannels(r *http.Request) ([]Channel, error) {
 
 // writeGeneratedErrorResponse 写回代理本地生成的错误响应。
 func (p *Proxy) writeGeneratedErrorResponse(w http.ResponseWriter, ctx *Context, errType, message string, code int, err error) {
+	p.writeLabeledErrorResponse(w, ctx, "", errType, message, code, err)
+}
+
+// writeLabeledErrorResponse 同 writeGeneratedErrorResponse，label 指定前缀中的渠道标识（为空时取当前渠道）。
+func (p *Proxy) writeLabeledErrorResponse(w http.ResponseWriter, ctx *Context, label, errType, message string, code int, err error) {
 	message = sanitizeClientFacingErrorMessage(message)
-	if prefix := errorPrefix(nil, ctx); prefix != "" {
+	if prefix := errorPrefixWithLabel(nil, ctx, label); prefix != "" {
 		message = fmt.Sprintf("%s %s", prefix, message)
 	}
 

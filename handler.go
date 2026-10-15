@@ -15,6 +15,8 @@ type pipelineResult struct {
 	successResp *http.Response
 	lastResp    *http.Response
 	lastErr     error
+	// involved 为实际尝试或因熔断跳过的渠道数，用于选择最终错误文案。
+	involved int
 }
 
 type retryDecision struct {

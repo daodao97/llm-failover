@@ -1,6 +1,9 @@
 package failover
 
-import "encoding/base64"
+import (
+	"encoding/base64"
+	"strconv"
+)
 
 var maskKey = []byte("llm_failover_mask_key")
 
@@ -38,4 +41,17 @@ func UnmaskChannelName(masked string) string {
 		buf[i] = data[i] ^ maskKey[i%len(maskKey)]
 	}
 	return string(buf)
+}
+
+// ChannelLabel 返回客户端可见的渠道标识：混淆后的渠道 id；渠道来自分组时追加明文分组 id，
+// 格式为 "{hash_channel_id} {group_id}"。
+func ChannelLabel(ch *Channel) string {
+	if ch == nil {
+		return ""
+	}
+	label := MaskChannelName(strconv.Itoa(ch.Id))
+	if label != "" && ch.ChannelGroupID > 0 {
+		label += " " + strconv.Itoa(ch.ChannelGroupID)
+	}
+	return label
 }
