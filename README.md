@@ -276,6 +276,8 @@
 - 支持 `OnSSE` 逐事件观察
 - 支持 `TransformSSE` 转换事件内容
 
+若业务在 `AfterProxy` 中包装响应体进行首输出预检，拒绝流时可将具体错误写入 `Context.LastResponseBody` 的 `error.type` / `error.message`。首读零字节时，重试日志优先保留该原因；零字节读取错误也会保留错误链，避免将本地超时、连接重置等一律记成 `sse_error: empty response`。没有错误证据的空流仍使用原有的空响应判定。
+
 这意味着它不仅能“透传流”，还能在流式场景下继续做稳定性治理。
 
 

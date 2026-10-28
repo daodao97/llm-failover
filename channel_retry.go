@@ -429,7 +429,7 @@ func (p *Proxy) evaluateRetryDecision(ctx *Context, cfg RetryConfig, resp *http.
 		return decision
 	}
 
-	peek, _ := peekBody(resp, 512)
+	peek, peekErr := peekBody(resp, 512)
 	decision.ssePeek = peek
 
 	// 空 SSE（成功状态码 + text/event-stream，但首读即 0 字节）永远判失败：这种响应没有
@@ -444,7 +444,23 @@ func (p *Proxy) evaluateRetryDecision(ctx *Context, cfg RetryConfig, resp *http.
 	}
 
 	sseReason := "sse_error: empty response"
-	if len(peek) > 0 {
+	if len(peek) == 0 {
+		// AfterProxy 的预检包装器可能主动拒绝流，并在 LastResponseBody 中留下
+		// 具体原因；零字节并不等于上游没有发送内容，不能覆盖为笼统的空响应。
+		if message := gjson.GetBytes(ctx.LastResponseBody, "error.message").String(); message != "" {
+			kind := gjson.GetBytes(ctx.LastResponseBody, "error.type").String()
+			if kind != "" {
+				message = kind + ": " + message
+			}
+			if len(message) > 200 {
+				message = message[:200] + "..."
+			}
+			sseReason = "sse_error: " + strings.ReplaceAll(strings.ReplaceAll(message, "\n", "\\n"), "\r", "\\r")
+		} else if peekErr != nil {
+			sseReason = fmt.Sprintf("sse_read_error: %v", peekErr)
+		}
+		decision.sseReadErr = peekErr
+	} else {
 		peekStr := string(peek)
 		if len(peekStr) > 200 {
 			peekStr = peekStr[:200] + "..."
@@ -481,5 +497,14 @@ func (p *Proxy) buildRetryError(ctx *Context, resp *http.Response, decision retr
 		}
 	}
 
-	return wrapChannelError(ctx.Channel, fmt.Errorf("retry: %s", retryReason)), retryReason
+	return wrapChannelError(ctx.Channel, &retryResponseError{reason: retryReason, cause: decision.sseReadErr}), retryReason
 }
+
+// 保留预读失败的错误链，让观察器区分网络错误、取消与本地预检错误。
+type retryResponseError struct {
+	reason string
+	cause  error
+}
+
+func (e *retryResponseError) Error() string { return "retry: " + e.reason }
+func (e *retryResponseError) Unwrap() error { return e.cause }

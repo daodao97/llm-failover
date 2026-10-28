@@ -26,6 +26,7 @@ type retryDecision struct {
 	statusRetry bool
 	isSSE       bool
 	ssePeek     []byte
+	sseReadErr  error
 }
 
 var (

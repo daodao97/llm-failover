@@ -1,11 +1,36 @@
 package failover
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 )
+
+func TestSSEPreflightRetainsHookFailureInsteadOfEmptyResponse(t *testing.T) {
+	const original = `{"error":{"type":"proxy_sse_first_output_timeout","message":"Proxy stopped waiting after 180s"}}`
+	ctx := &Context{Channel: &Channel{Id: 1}, TargetHeader: http.Header{}, LastResponseBody: []byte(original)}
+	resp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(""))}
+	p := &Proxy{}
+	decision := p.evaluateRetryDecision(ctx, RetryConfig{}, resp)
+	err, reason := p.buildRetryError(ctx, resp, decision)
+	if !strings.Contains(reason, "proxy_sse_first_output_timeout") || strings.Contains(err.Error(), "empty response") || string(ctx.LastResponseBody) != original {
+		t.Fatalf("预检原因丢失: reason=%q err=%v body=%s", reason, err, ctx.LastResponseBody)
+	}
+}
+
+func TestSSEPreflightZeroByteReadRetainsOriginalError(t *testing.T) {
+	want := errors.New("upstream connection reset")
+	ctx := &Context{Channel: &Channel{Id: 1}, TargetHeader: http.Header{}}
+	resp := &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: &dataThenErrorReadCloser{err: want}}
+	p := &Proxy{}
+	decision := p.evaluateRetryDecision(ctx, RetryConfig{}, resp)
+	err, reason := p.buildRetryError(ctx, resp, decision)
+	if !errors.Is(err, want) || !strings.Contains(reason, "sse_read_error: upstream connection reset") || strings.Contains(reason, "empty response") {
+		t.Fatalf("读取错误被误报为空响应: reason=%q err=%v", reason, err)
+	}
+}
 
 type chunkedReadCloser struct {
 	chunks    [][]byte
