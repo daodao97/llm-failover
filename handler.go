@@ -114,6 +114,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := &Context{
 		Request: r,
 	}
+	defer p.releaseRequestBody(ctx)
 	p.initFailoverDeadline(ctx)
 	r, cancelFailover := failoverRequestWithDeadline(r, ctx)
 	defer cancelFailover()

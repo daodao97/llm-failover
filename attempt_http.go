@@ -56,10 +56,20 @@ func (p *Proxy) executeHTTPAttempt(r *http.Request, ctx *Context, ch *Channel, k
 
 	// 使用可能被钩子修改后的数据创建请求
 	var bodyReader io.Reader = bytes.NewReader(ctx.RequestBody)
+	var uploadBuffer *requestBodyBuffer
+	if p.cfg.ShareRequestBody && len(ctx.RequestBody) > 0 {
+		uploadBuffer = &requestBodyBuffer{data: ctx.RequestBody}
+		defer uploadBuffer.release()
+		bodyReader, _ = uploadBuffer.uploadReader()
+	}
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, ctx.TargetURL, bodyReader)
 	if err != nil {
 		return nil, err
+	}
+	if uploadBuffer != nil {
+		req.ContentLength = int64(len(ctx.RequestBody))
+		req.GetBody = uploadBuffer.uploadReader
 	}
 
 	// 应用目标请求头
