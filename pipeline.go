@@ -21,6 +21,15 @@ var requestIDAnnotationPattern = regexp.MustCompile(`(?i)\s*\(request id:\s*[^)]
 // prepareRequestBody 预读请求体，用于重试场景下复用。
 // 失败时已写回错误响应，返回的 error 供调用方上报（如 Observer.OnRequestDone）。
 func (p *Proxy) prepareRequestBody(w http.ResponseWriter, ctx *Context) error {
+	if p.cfg.ShareRequestBody {
+		if buffered, ok := ctx.Request.Body.(*BufferedRequestBody); ok {
+			ctx.requestBodyBuffer = buffered.buffer
+			ctx.RequestBody = buffered.Bytes()
+			ctx.OriginalRequestBody = ctx.RequestBody
+			setSharedRequestBody(ctx.Request, buffered.buffer)
+			return nil
+		}
+	}
 	var bodyBytes []byte
 	if ctx.Request.Body != nil {
 		var err error
@@ -32,6 +41,12 @@ func (p *Proxy) prepareRequestBody(w http.ResponseWriter, ctx *Context) error {
 		ctx.Request.Body.Close()
 	}
 
+	if p.cfg.ShareRequestBody {
+		ctx.requestBodyBuffer = &requestBodyBuffer{data: bodyBytes}
+		ctx.RequestBody, ctx.OriginalRequestBody = bodyBytes, bodyBytes
+		setSharedRequestBody(ctx.Request, ctx.requestBodyBuffer)
+		return nil
+	}
 	resetRequestBody(ctx.Request, bodyBytes)
 	ctx.RequestBody = bodyBytes
 	if len(bodyBytes) > 0 {
@@ -43,7 +58,14 @@ func (p *Proxy) prepareRequestBody(w http.ResponseWriter, ctx *Context) error {
 // selectChannels 阶段一：选择可用渠道。
 // 失败时已写回错误响应，返回的 error 供调用方上报（如 Observer.OnRequestDone）。
 func (p *Proxy) selectChannels(w http.ResponseWriter, r *http.Request, ctx *Context) ([]Channel, error) {
-	channels, err := p.enabledChannels(cloneRequestWithBody(r, ctx.RequestBody))
+	var request *http.Request
+	if ctx.requestBodyBuffer != nil {
+		request = r.Clone(r.Context())
+		setSharedRequestBody(request, ctx.requestBodyBuffer)
+	} else {
+		request = cloneRequestWithBody(r, ctx.RequestBody)
+	}
+	channels, err := p.enabledChannels(request)
 	if err != nil {
 		errType, status := "api_error", classifySelectChannelsStatus(err)
 		var requestErr *RequestError
@@ -334,6 +356,7 @@ func (p *Proxy) writePipelineResponse(w http.ResponseWriter, r *http.Request, ct
 		if result.lastResp != nil {
 			result.lastResp.Body.Close()
 		}
+		p.releaseRequestBody(ctx)
 		p.writeResponse(w, result.successResp, ctx)
 		p.recordChannelSuccess(r, ctx)
 		return

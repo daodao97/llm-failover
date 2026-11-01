@@ -15,14 +15,22 @@ const (
 )
 
 type Config struct {
-	Channels       []Channel
-	GetChannels    func(r *http.Request) ([]Channel, error) // 动态获取 channels，优先于 Channels
-	Retry          RetryConfig
-	Client         *http.Client
-	Logger         Logger                            // 可选日志接口，默认 no-op
-	Observer       Observer                          // 可选可观测接口，默认 no-op
-	ErrorBody      func(errType, message string) any // 自定义错误响应体结构，返回的对象会被 JSON 编码
-	CircuitBreaker CircuitBreakerConfig
+	Channels    []Channel
+	GetChannels func(r *http.Request) ([]Channel, error) // 动态获取 channels，优先于 Channels
+	Retry       RetryConfig
+	Client      *http.Client
+	// ShareRequestBody 允许中间件和重试共享只读正文，避免完整副本。
+	// 启用后 hook 必须通过替换 RequestBody 改写正文，不能原地修改字节。
+	// 重试结束、成功响应开始转发前会清空正文，响应/完成 hook 不应再读取它。
+	// 默认关闭，保留原有可变副本与完整生命周期。
+	ShareRequestBody bool
+	// OnRequestBodyRelease 在共享正文释放前调用一次，让宿主清除转换缓存等引用。
+	// 成功时所有重试判断已结束；失败时在错误处理和最终观测完成后调用。
+	OnRequestBodyRelease func(ctx *Context)
+	Logger               Logger                            // 可选日志接口，默认 no-op
+	Observer             Observer                          // 可选可观测接口，默认 no-op
+	ErrorBody            func(errType, message string) any // 自定义错误响应体结构，返回的对象会被 JSON 编码
+	CircuitBreaker       CircuitBreakerConfig
 	// CircuitBreakerStore 配置熔断状态存储。为空时使用当前 Proxy 内存存储。
 	CircuitBreakerStore CircuitBreakerStore
 	// FailoverTimeout 限制整条 failover 尝试链路的最长耗时。为空时不限制。
@@ -105,7 +113,9 @@ type Context struct {
 	AttemptDeadline          time.Time
 	// StreamReadErr 记录转发响应体时上游侧的读错误（如 SSE 半路断流）。
 	// 客户端断开会以 context 取消的形式出现，不计入渠道失败。
-	StreamReadErr error
+	StreamReadErr       error
+	requestBodyBuffer   *requestBodyBuffer
+	requestBodyReleased bool
 }
 
 func (c *Context) resetForChannel() {
@@ -129,7 +139,11 @@ func (c *Context) resetForChannel() {
 	c.ResponseContentEncodings = nil
 	c.PoolStats = PoolStats{}
 	c.StreamReadErr = nil
-	c.RequestBody = cloneBytes(c.OriginalRequestBody)
+	if c.requestBodyBuffer != nil {
+		c.RequestBody = c.OriginalRequestBody
+	} else {
+		c.RequestBody = cloneBytes(c.OriginalRequestBody)
+	}
 }
 
 func (c *Context) resetForAttempt(targetHeader http.Header) {

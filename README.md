@@ -91,6 +91,17 @@
 - `OriginalRequestBody`：原始请求体副本
 - `RequestBody`：当前尝试可修改的请求体
 
+大请求可显式开启 `Config.ShareRequestBody`。中间件用
+`NewBufferedRequestBody(raw)` 保存正文后，代理和渠道重试共享只读字节，
+不再为原文、重放 reader 和渠道选择复制整份正文。hook 改写时必须替换
+`ctx.RequestBody`，不能原地修改切片；默认模式不受影响。
+
+成功响应通过所有重试判断后，代理在转发响应体前释放请求正文；失败时在
+错误处理和最终观测完成后释放。开启此模式的 `OnBody`、`OnSSE` 和成功
+完成观测不应再读取请求正文。宿主可通过 `OnRequestBodyRelease` 提前保存
+计费档位等小型元数据，并清理协议转换缓存。仍在上传的 HTTP reader
+独立持有数据直到 transport 关闭，307/308 重定向期间仍可完整重放。
+
 
 ### 2. 渠道选择
 
@@ -378,6 +389,7 @@
 - `Channels` / `GetChannels`
 - `Retry`
 - `Client`
+- `ShareRequestBody` / `OnRequestBodyRelease`
 - `Logger`
 - `CircuitBreaker`
 - `ShouldCountFailureForCircuit`
